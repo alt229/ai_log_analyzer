@@ -1,0 +1,8 @@
+# requirements.txt
+pyyaml           # For config file handling
+colorama         # For colored output
+paramiko         # For SSH connections
+anthropic        # For Claude AI
+openai           # For ChatGPT
+google-generativeai  # For Gemini
+docker           # For Docker integration
