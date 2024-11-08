@@ -159,6 +159,8 @@ AI analysis options:
   - google-generativeai
   - docker
 
+pip install -r requirements.txt
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit pull requests.
