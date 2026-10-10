@@ -1,8 +1,13 @@
-# requirements.txt
-pyyaml           # For config file handling
-colorama         # For colored output
-paramiko         # For SSH connections
-anthropic        # For Claude AI
-openai           # For ChatGPT
-google-generativeai  # For Gemini
-docker           # For Docker integration
+# Core
+pyyaml           # Config file handling
+colorama         # Colored terminal output
+paramiko         # SSH connections (Mac/Linux remote)
+
+# AI providers (install only what you use)
+anthropic        # Claude AI
+openai           # ChatGPT
+google-genai     # Gemini  (replaces deprecated google-generativeai)
+
+# Optional integrations
+docker           # Docker container log collection
+impacket         # Windows WMI/DCOM remote access (for --windows)

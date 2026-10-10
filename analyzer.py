@@ -1,22 +1,34 @@
 # analyzer.py
+# History:
+# 2026-10-09 - Script Wrangler: Linux/journalctl process names containing
+#   - . / @ (sshd-session, systemd-logind, postfix/smtpd) are read whole
+#   instead of becoming 'unknown'; noise_filters.py changed in step.
 import re
 from datetime import datetime
 from collections import defaultdict
 from colorama import init, Fore, Style
 import json
+from log_dedup import LogDedup
 
 # Initialize colorama for cross-platform colored output
 init()
 
+# macOS syslog shape: "2026-10-08 12:00:00.123456-0700  localhost Bartender 6[123]:"
+# (process names may contain spaces)
+MAC_SYSLOG_PROC = re.compile(
+    r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+[-+]\d{4}\s+\S+\s+(\S[^\[\]]*?)\[\d+\]:')
+
 class LogAnalyzer:
     def __init__(self, use_color=True, output_file=None, output_json=False, 
-                 show_full=False, debug=False, show_levels=None):
+                 show_full=False, debug=False, show_levels=None, ai_examples=1):
         self.use_color = use_color
         self.output_file = output_file
         self.output_json = output_json
         self.show_full = show_full
         self.debug = debug
         self.show_levels = show_levels or {'error', 'warning', 'info'}
+        self.ai_examples = ai_examples   # raw example lines per pattern for the AI
+        self.report_notes = []   # extra lines from main.py: noise filters, changes vs baseline
         
         # Enhanced patterns with better filtering
         self.patterns = {
@@ -82,7 +94,10 @@ class LogAnalyzer:
         self.unique_messages = defaultdict(set)
         self.grouped_messages = defaultdict(lambda: defaultdict(list))
         self.total_lines_processed = 0
-        self.total_matches = 0
+        self.total_matches = 0      # matched lines (the same set the AI digest counts)
+        self.distinct_matches = 0   # of those, new messages per group (the old count)
+        # Every matched line, grouped into patterns with counts (what the AI gets)
+        self.dedup = LogDedup(keep_examples=self.ai_examples)
 
     def analyze_line(self, line):
         """Analyze a single log line for patterns"""
@@ -91,16 +106,27 @@ class LogAnalyzer:
 
         self.total_lines_processed += 1
 
-        # Extract process name for better grouping
-        process_match = re.search(r'\s(\w+)\[\d+\]:', line)
-        process_name = process_match.group(1) if process_match else 'unknown'
+        # Extract process name for better grouping: the full name from macOS
+        # ndjson (collector.LogLine), else the macOS syslog shape, else the
+        # Linux "ident[pid]:" (ident may have - . / @: sshd-session,
+        # postfix/smtpd; same as noise_filters._PLAIN_PROC, keep in step)
+        process_name = getattr(line, 'process', None)
+        if not process_name:
+            process_match = MAC_SYSLOG_PROC.match(line) or re.search(r'\s([\w./@-]+)\[\d+\]:', line)
+            process_name = process_match.group(1) if process_match else 'unknown'
+        # 'critical' (fault) or 'error' when the macOS log type says so, else None
+        level = getattr(line, 'level', None)
 
         matched = False
+        recorded = False   # into self.dedup once, under its most severe type
         for issue_type, config in self.patterns.items():
             if issue_type not in self.show_levels:
                 continue
 
-            if re.search(config['pattern'], line, re.IGNORECASE):
+            # A macOS error/fault counts as an error by its log type, whatever
+            # its wording (and only as an error); other lines go by keywords
+            hit = (issue_type == 'error') if level else re.search(config['pattern'], line, re.IGNORECASE)
+            if hit:
                 # Check ignore patterns
                 should_ignore = False
                 for ignore in config['ignore']:
@@ -112,6 +138,11 @@ class LogAnalyzer:
                 
                 if should_ignore:
                     continue
+
+                if not recorded:
+                    self.dedup.add(level or issue_type, process_name, line)
+                    recorded = True
+                    self.total_matches += 1   # once per line, like the dedup
 
                 # Check group patterns
                 grouped = False
@@ -139,7 +170,7 @@ class LogAnalyzer:
 
                 if matched:
                     self.alerts[issue_type] += 1
-                    self.total_matches += 1
+                    self.distinct_matches += 1
 
     def _create_error_summary(self, line: str, process_name: str) -> str:
         """Create a summary of the error message, removing variable parts"""
@@ -176,8 +207,12 @@ class LogAnalyzer:
             output.append(f"\n{Fore.CYAN}Active Filters:{Style.RESET_ALL}")
             output.append(f"Showing only: {', '.join(sorted(self.show_levels))}")
         
+        # Notes from main.py (noise filter count, changes vs baseline)
+        output.extend(self.report_notes)
+
         output.append(f"\nTotal lines processed: {self.total_lines_processed}")
-        output.append(f"Total matches found: {self.total_matches}\n")
+        output.append(f"Total matches found: {self.total_matches} lines "
+                      f"({self.distinct_matches} distinct messages)\n")
         
         # Grouped messages
         for issue_type, groups in self.grouped_messages.items():
@@ -213,7 +248,7 @@ class LogAnalyzer:
                 continue
                 
             color = Fore.RED if issue_type == 'error' else Fore.YELLOW if issue_type == 'warning' else Fore.BLUE
-            output.append(self.colorize(f"{issue_type}: {count} total issues", color))
+            output.append(self.colorize(f"{issue_type}: {count} distinct message(s)", color))
             
         if self.show_full:
             output.append("\nNote: Showing full messages (--full flag is enabled)")
@@ -227,29 +262,22 @@ class LogAnalyzer:
         return text
 
     def get_results(self, summarize: bool = False) -> dict:
-        """Get the analysis results"""
-        if summarize:
-            # Return summarized log data
-            return {
-                'alerts': dict(self.alerts),
-                'grouped_messages': dict(self.grouped_messages),
-                'unique_messages': dict(self.unique_messages),
-                'stats': {
-                    'total_lines': self.total_lines_processed,
-                    'total_matches': self.total_matches
-                }
+        """Get the analysis results, including any Windows summary if present."""
+        result = {
+            'alerts': dict(self.alerts),
+            'grouped_messages': dict(self.grouped_messages),
+            'unique_messages': dict(self.unique_messages),
+            'stats': {
+                'total_lines': self.total_lines_processed,
+                'total_matches': self.total_matches,
+                'distinct_matches': self.distinct_matches
             }
-        else:
-            # Return raw log data
-            return {
-                'alerts': dict(self.alerts),
-                'grouped_messages': dict(self.grouped_messages),
-                'unique_messages': dict(self.unique_messages),
-                'stats': {
-                    'total_lines': self.total_lines_processed,
-                    'total_matches': self.total_matches
-                }
-            }
+        }
+        # Include Windows Event Log summary if it was collected
+        win_summary = getattr(self, '_windows_summary', None)
+        if win_summary:
+            result['_windows_summary'] = win_summary
+        return result
 
     def run(self, collector, hours=1):
         """Main analysis loop"""

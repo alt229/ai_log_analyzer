@@ -2,6 +2,7 @@
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import json
+import sys
 
 class RemoteDockerLogCollector:
     def __init__(self, ssh_client, config: dict):
@@ -9,23 +10,32 @@ class RemoteDockerLogCollector:
         self.max_lines = config.get('max_log_lines', 1000)
         self.excluded = config.get('excluded_containers', [])
         self.socket_path = config.get('socket', '/var/run/docker.sock')
+        self.errors = []   # failed `docker logs` calls; main.py exits 1 if any
 
-    def _exec_command(self, command: str) -> tuple:
-        """Execute command over SSH and return output"""
+    def _run(self, command: str) -> tuple:
+        """Execute command over SSH: (stdout, stderr, remote exit status)"""
         # Add DOCKER_HOST environment variable if custom socket is specified
         if self.socket_path:
             command = f'DOCKER_HOST="unix://{self.socket_path}" {command}'
         stdin, stdout, stderr = self.ssh.exec_command(command)
-        return stdout.read().decode('utf-8'), stderr.read().decode('utf-8')
+        out = stdout.read().decode('utf-8', 'replace')
+        err = stderr.read().decode('utf-8', 'replace')
+        return out, err, stdout.channel.recv_exit_status()
+
+    def _exec_command(self, command: str) -> tuple:
+        """Execute command over SSH and return output"""
+        out, err, _ = self._run(command)
+        return out, err
 
     def get_containers(self) -> List[Dict]:
         """Get list of running containers"""
         command = 'docker ps --format "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}"'
-        stdout, stderr = self._exec_command(command)
-        
-        if stderr:
-            print(f"Warning getting containers: {stderr}")
-            return []
+        stdout, stderr, rc = self._run(command)
+
+        if rc != 0:   # e.g. permission denied on the socket, docker not installed
+            raise RuntimeError(f"docker ps failed (exit {rc}): {stderr.strip() or 'no error message'}")
+        if stderr.strip():
+            print(f"Warning getting containers: {stderr.strip()}", file=sys.stderr)
             
         containers = []
         for line in stdout.splitlines():
@@ -43,8 +53,9 @@ class RemoteDockerLogCollector:
 
     def get_container_logs(self, hours: float = 1, container_name: Optional[str] = None) -> Dict[str, List[str]]:
         """Get logs from containers"""
-        since = datetime.now() - timedelta(hours=hours)
-        since_arg = since.strftime('%Y-%m-%dT%H:%M:%S')
+        # Relative duration ("900s"): docker on the remote host counts back from
+        # its own clock, so the Mac's time zone does not shift the window.
+        since_arg = f"{max(1, round(hours * 3600))}s"
         logs = {}
 
         containers = self.get_containers()
@@ -54,14 +65,20 @@ class RemoteDockerLogCollector:
                 continue
 
             command = f'docker logs --since {since_arg} --tail {self.max_lines} --timestamps {container["id"]}'
-            stdout, stderr = self._exec_command(command)
-            
-            if stderr:
-                print(f"Warning getting logs for {container['name']}: {stderr}")
+            stdout, stderr, rc = self._run(command)
+
+            if rc != 0:
+                msg = (f"docker logs {container['name']} failed (exit {rc}): "
+                       f"{stderr.strip() or 'no error message'}")
+                print(f"Error: {msg}", file=sys.stderr)
+                self.errors.append(msg)
                 continue
-                
-            if stdout:
-                logs[container['name']] = stdout.splitlines()
+
+            # Exit 0: stderr is the container's own stderr stream, i.e. log lines
+            # too. Both carry --timestamps (fixed width), so sorting merges them.
+            lines = stdout.splitlines() + stderr.splitlines()
+            if lines:
+                logs[container['name']] = sorted(lines, key=lambda l: l.split(' ', 1)[0])
 
         return logs
 
