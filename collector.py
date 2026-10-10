@@ -1,5 +1,10 @@
 # collector.py
 # History:
+# 2026-10-10 - Script Wrangler: --guest: with self.guest set (a Proxmox LXC
+#   container id), journalctl and the identity command run inside that
+#   container via `pct exec ID -- sh -c '...'` on the --host (needs root
+#   there); the guest has no SSH host key of its own (identify() leaves it
+#   out). list_guests() reads `pct list` for --guest all (guest.patch).
 # 2026-10-09 - Script Wrangler: the SSH host key is checked during the
 #   handshake, before login (HostKeyCheck replaces AutoAddPolicy): known
 #   from ~/.ssh/known_hosts (read only) or hosts.json -> go on; unknown ->
@@ -19,6 +24,7 @@ import inspect
 import subprocess
 from datetime import datetime, timedelta
 import paramiko
+import shlex
 from typing import List, Optional
 import platform
 import os
@@ -216,6 +222,7 @@ class LogCollector:
         self.hostkey_refused = False # True: changed host key, connection refused (warning printed)
         self.hostkey_info = None     # set by _check_hostkey: type, fingerprint, verdict
         self._recorded_keys = []     # [(type, fingerprint, where)] for this host, for _check_hostkey
+        self.guest = None            # main.py --guest: Proxmox LXC id; commands run via pct exec
 
     @staticmethod
     def _check_result(what, rc, stdout, stderr):
@@ -266,6 +273,37 @@ class LogCollector:
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"Failed to get Linux logs: {str(e)}")
 
+    def _remote_cmd(self, cmd: str) -> str:
+        """cmd as sent over SSH: inside LXC container self.guest via pct exec
+        (on the Proxmox --host, as root), else unchanged."""
+        if self.guest:
+            return f"pct exec {int(self.guest)} -- sh -c {shlex.quote(cmd)}"
+        return cmd
+
+    def _where(self) -> str:
+        return f"{self.host} CT {self.guest}" if self.guest else str(self.host)
+
+    def list_guests(self) -> List[tuple]:
+        """Running LXC containers on the Proxmox --host, from `pct list`:
+        [(id, name)], in pct list order. Raises RuntimeError (with pct's own
+        error) if the command fails, e.g. not a Proxmox host or not root."""
+        self._connect_ssh()
+        if self.ssh is None:
+            raise RuntimeError('no SSH connection (--host and --user needed)')
+        _stdin, stdout, stderr = self.ssh.exec_command('pct list', timeout=60)
+        out = stdout.read().decode('utf-8', 'replace')
+        err = stderr.read().decode('utf-8', 'replace')
+        rc = stdout.channel.recv_exit_status()
+        if rc != 0:
+            raise RuntimeError(f"pct list on {self.host} failed (exit {rc}): "
+                               f"{err.strip() or 'no error message'}")
+        guests = []
+        for line in out.splitlines()[1:]:   # VMID Status [Lock] Name
+            parts = line.split()
+            if len(parts) >= 3 and parts[0].isdigit() and parts[1] == 'running':
+                guests.append((parts[0], parts[-1]))
+        return guests
+
     def _get_logs_remote(self, seconds: int) -> List[str]:
         """Get logs from remote system via SSH (the last `seconds` seconds)"""
         self._connect_ssh()
@@ -274,13 +312,13 @@ class LogCollector:
         cmd = f"journalctl --since '{int(seconds)}s ago'"
         
         try:
-            stdin, stdout, stderr = self.ssh.exec_command(cmd)
+            stdin, stdout, stderr = self.ssh.exec_command(self._remote_cmd(cmd))
             out = stdout.read().decode('utf-8', 'replace')
             err = stderr.read().decode('utf-8', 'replace')
             rc = stdout.channel.recv_exit_status()
         except Exception as e:
             raise RuntimeError(f"Failed to get remote logs: {str(e)}")
-        self._check_result(f"journalctl on {self.host}", rc, out, err)
+        self._check_result(f"journalctl on {self._where()}", rc, out, err)
         return out.splitlines()
 
     def _connect_ssh(self):
@@ -480,7 +518,9 @@ class LogCollector:
         raises; a failed connection is raised again by get_logs(). With a host
         key also 'hostkey_type' (e.g. ssh-ed25519) and 'hostkey_replace'
         (--accept-hostkey-change). A refused host key (self.hostkey_refused)
-        is a failed connection: no command is run."""
+        is a failed connection: no command is run. With self.guest (--guest)
+        the command runs in that container and no host key is given: the key
+        belongs to the Proxmox host, not to the guest."""
         import target_store
         if not self.host:
             return target_store.local_identity()
@@ -490,16 +530,17 @@ class LogCollector:
             if self.ssh is None:   # no --user: nothing to connect with
                 ident['error'] = 'no SSH connection'
                 return ident
-            key = self.ssh.get_transport().get_remote_server_key()
-            ident['hostkey'] = key_fingerprint(key)
-            ident['hostkey_type'] = key.get_name()
-            ident['hostkey_replace'] = bool(self.accept_hostkey_change)
+            if not self.guest:   # a guest has no host key of its own (see above)
+                key = self.ssh.get_transport().get_remote_server_key()
+                ident['hostkey'] = key_fingerprint(key)
+                ident['hostkey_type'] = key.get_name()
+                ident['hostkey_replace'] = bool(self.accept_hostkey_change)
         except Exception as e:
             ident['error'] = 'no SSH connection' if self.connect_error else f"no SSH host key: {e}"
             if self.connect_error:
                 return ident
         try:
-            _stdin, stdout, _stderr = self.ssh.exec_command(IDENTIFY_CMD, timeout=20)
+            _stdin, stdout, _stderr = self.ssh.exec_command(self._remote_cmd(IDENTIFY_CMD), timeout=20)
             out = stdout.read().decode('utf-8', 'replace')
             stdout.channel.recv_exit_status()
             ident.update(target_store.parse_identity(out))

@@ -22,6 +22,9 @@
 #                            (--user defaults to your local username)
 #   --accept-hostkey-change  with --host: accept a CHANGED SSH host key
 #                            for this run (after checking it) and record it
+#   --guest ID|all           with --host on a Proxmox host (as root): the logs
+#                            of LXC container ID (pct exec) instead of the
+#                            host's; all = each running container in turn
 #   --docker                 add Docker container logs (REQUIRES --host)
 #   --windows --win-host H   Windows Event Log via WMI
 # Time:  -t/--time DURATION: 90s, 15m, 2h, 1d, 1h30m (any case); a bare
@@ -243,6 +246,15 @@
 #   a server with several keys shows a recorded one. If it offers none of
 #   those types any more, that counts as a change (refused). Keys recorded
 #   in hosts.json before 2026-10-09 have no type; a mismatch is a change.
+# - --guest ID: journalctl and the identity command run inside the
+#   container (`pct exec ID -- sh -c ...`), so --user must be root on the
+#   Proxmox host. The container is its own target: hosts.json name
+#   HOST/ctID, matched by the container's machine-id, folder = its host
+#   name (else HOST-ctID). The SSH host key check is the Proxmox host's;
+#   a changed key is accepted on a run without --guest. --guest all runs
+#   main.py once per running container (pct list), same options, a header
+#   line each; containers without journald fail (exit 1) like any other
+#   failed collection. Not with --docker, -o or --status-file (all).
 # - Not used from known_hosts: wildcard patterns, @cert-authority and
 #   @revoked lines, ssh-dss keys, ~/.ssh/config (HostKeyAlias etc.).
 # - analyzer.py's "success" ignore pattern also matches "unsuccessful", so
@@ -298,6 +310,12 @@
 # ORIGIN / HISTORY
 # No author, version or date in the file (line 2 is just "# main.py").
 # History:
+# 2026-10-10 - Script Wrangler: --guest ID|all reads a Proxmox LXC
+#   container's journal through the host (pct exec); each container is its
+#   own target (machine-id, folder named after its host name); all = one
+#   run per running container, exit 1 if any failed. A run with no
+#   patterns now saves a 0-pattern baseline instead of none, so quiet
+#   machines work with --ai-changes-only (guest.patch).
 # 2026-10-09 - Script Wrangler: one folder per machine (hosts.json: the
 #   machine-id / SSH host key is checked right after connecting, before
 #   the baseline and noise.yaml are read); --list-targets, --rename-target
@@ -378,6 +396,8 @@ def write_status_file(path, exit_code):
             'ai_called': called, 'ai_skipped_reason': reason,
             'new': s.get('new', 0), 'spike': s.get('spike', 0), 'lines': s.get('lines', 0),
             'patterns': s.get('patterns', 0), 'exit_code': exit_code}
+    if s.get('guest'):
+        data['guest'] = s['guest']
     path = os.path.abspath(os.path.expanduser(path))
     tmp = path + '.tmp'
     try:
@@ -390,6 +410,70 @@ def write_status_file(path, exit_code):
         os.replace(tmp, path)
     except OSError as e:
         print(f"{Fore.RED}--status-file: {path} not written: {e}{Style.RESET_ALL}", file=sys.stderr)
+
+
+def guest_argv(argv, gid):
+    """argv with --guest all (or --guest=all) replaced by --guest gid."""
+    out, skip = [], False
+    for i, a in enumerate(argv):
+        if skip:
+            skip = False
+            continue
+        if a == '--guest' and i + 1 < len(argv):
+            out += ['--guest', gid]
+            skip = True
+        elif a.startswith('--guest='):
+            out.append(f"--guest={gid}")
+        else:
+            out.append(a)
+    return out
+
+
+def run_all_guests(collector, args):
+    """--guest all: list the running LXC containers on --host (pct list), then
+    run this script once per container with the same options and --guest ID.
+    Returns the exit code: 0, or 1 if listing failed or any run did not exit 0."""
+    import subprocess
+    try:
+        guests = collector.list_guests()
+    except KeyboardInterrupt:
+        print("\nAnalysis interrupted by user")
+        return 1
+    except Exception as e:
+        if getattr(collector, 'hostkey_refused', False):
+            print(f"{Fore.RED}Stopped: SSH host key of {args.host} not accepted (warning above); "
+                  f"nothing was collected.{Style.RESET_ALL}", file=sys.stderr)
+        else:
+            print(f"{Fore.RED}--guest all: could not list containers on {args.host}: {e}"
+                  f"{Style.RESET_ALL}", file=sys.stderr)
+        return 1
+    if collector.ssh:
+        collector.ssh.close()
+        collector.ssh = None
+    if not guests:
+        print(f"{Fore.YELLOW}--guest all: no running LXC containers on {args.host}."
+              f"{Style.RESET_ALL}")
+        return 0
+    print(f"{args.host}: {len(guests)} running container(s): "
+          + ', '.join(f"{g} ({n})" for g, n in guests))
+    failed = []
+    for gid, name in guests:
+        print(f"\n{Fore.CYAN}===== {args.host} CT {gid} ({name}) ====={Style.RESET_ALL}", flush=True)
+        sys.stderr.flush()
+        try:
+            rc = subprocess.run([sys.executable, os.path.abspath(__file__)]
+                                + guest_argv(sys.argv[1:], gid)).returncode
+        except KeyboardInterrupt:
+            print("\nAnalysis interrupted by user")
+            return 1
+        if rc != 0:
+            failed.append(f"{gid} ({name}) exit {rc}")
+    if failed:
+        print(f"\n{Fore.RED}--guest all: {len(failed)} of {len(guests)} failed: "
+              f"{', '.join(failed)}{Style.RESET_ALL}", file=sys.stderr)
+        return 1
+    print(f"\n--guest all: {len(guests)} container(s) done.")
+    return 0
 
 
 def resolve_api_key(provider, config, cli_key=None):
@@ -702,6 +786,11 @@ Examples:
                                    'server: accept it for this run and record it in hosts.json '
                                    '(replaces the old key of that type). Never edits '
                                    '~/.ssh/known_hosts')
+    remote_group.add_argument('--guest', metavar='ID|all',
+                              help='Proxmox host only (--user root): analyze LXC container ID '
+                                   '(pct exec) instead of the host; "all" = every running '
+                                   'container, one after another. Each container has its own '
+                                   'folder, baseline and noise.yaml')
 
     # Output options
     output_group = parser.add_argument_group('output options')
@@ -1151,6 +1240,22 @@ def _main():
         parser.error('--docker requires --host (Docker logs are read over SSH)')
     if args.accept_hostkey_change and not args.host:
         parser.error('--accept-hostkey-change needs --host')
+    if args.guest is not None:
+        args.guest = args.guest.strip().lower()
+        if not args.host:
+            parser.error('--guest needs --host (the Proxmox host)')
+        if args.guest != 'all' and not args.guest.isdigit():
+            parser.error(f"--guest: not a container id or 'all': {args.guest}")
+        if args.docker:
+            parser.error('--guest does not work with --docker')
+        if args.accept_hostkey_change:
+            parser.error('--accept-hostkey-change: run it once without --guest (the key is the '
+                         'Proxmox host\'s and is recorded for the host)')
+        if args.guest == 'all' and (args.output or args.status_file):
+            parser.error('--guest all does not work with -o/--output or --status-file '
+                         '(each container would overwrite the file); use --guest ID')
+        if args.local or args.windows:
+            parser.error('--guest only works with --host alone (not --local or --windows)')
     if args.windows and not args.win_host:
         parser.error('--win-host is required when using --windows')
     if args.deep_dive is not None:
@@ -1215,6 +1320,10 @@ def _main():
     # collector prints the warning): stop here, nothing read or written.
     collector = LogCollector(host=args.host, user=args.user, port=args.port, key_file=args.key)
     collector.accept_hostkey_change = args.accept_hostkey_change
+    if args.guest == 'all':
+        sys.exit(run_all_guests(collector, args))
+    if args.guest:
+        collector.guest = args.guest
     if target:
         try:
             ident = None if args.baseline_info else collector.identify()
@@ -1225,7 +1334,14 @@ def _main():
             print(f"{Fore.RED}Stopped: SSH host key of {args.host} not accepted (warning above); "
                   f"nothing was collected.{Style.RESET_ALL}", file=sys.stderr)
             sys.exit(1)
-        target, notes = target_store.resolve_target(args.host or target, target, ident)
+        name = args.host or target
+        if args.guest:   # the container is the target: HOST/ctID, folder = its host name
+            name = f"{args.host}/ct{args.guest}"
+            hostname = (ident or {}).get('hostname') or ''
+            target = (target_store.host_target(hostname.split('.')[0]) if hostname
+                      else f"{target}-ct{args.guest}")
+            RUN_STATUS['guest'] = args.guest
+        target, notes = target_store.resolve_target(name, target, ident)
         for note in notes:
             colour = Fore.RED if note.startswith('WARNING') else Fore.YELLOW
             print(f"{colour}{note}{Style.RESET_ALL}", file=sys.stderr)
@@ -1278,6 +1394,11 @@ def _main():
 
     failed = False       # set when an AI, Windows or Docker step fails -> exit 1
     system_info = None   # extra context for the AI (Docker stats, --system-info)
+    if args.guest:
+        system_info = {'proxmox_lxc_container': {
+            'proxmox_host': args.host, 'ct_id': args.guest, 'folder': target,
+            'note': 'These are the logs from inside this LXC container (pct exec), '
+                    'not from the Proxmox host.'}}
 
     try:
         # The collector was set up above (with --host, identify() connected it)
@@ -1447,18 +1568,20 @@ def _main():
                 if args.write_noise and write_noise(args.write_noise, entries, noise_path, by_id):
                     failed = True
             if args.save_baseline:
-                if not analyzer.dedup.patterns:
-                    print("No patterns in this run; baseline not saved.")
-                else:
-                    try:
-                        print(bl.save_baseline(baseline_path, analyzer.dedup, target,
-                                               'docker' if args.docker else 'system',
-                                               args.time * 60, replace=args.replace_baseline,
-                                               bucket_minutes=args.baseline_bucket,
-                                               start=run_start, end=run_end))
-                    except (OSError, RuntimeError) as e:
-                        failed = True
-                        print(f"{Fore.RED}Baseline not saved: {e}{Style.RESET_ALL}", file=sys.stderr)
+                # No patterns = a quiet machine: saved too (0 patterns), so
+                # --ai-changes-only works for it and any pattern later is NEW.
+                try:
+                    print(bl.save_baseline(baseline_path, analyzer.dedup, target,
+                                           'docker' if args.docker else 'system',
+                                           args.time * 60, replace=args.replace_baseline,
+                                           bucket_minutes=args.baseline_bucket,
+                                           start=run_start, end=run_end))
+                    if not analyzer.dedup.patterns:
+                        print("No patterns in this run (a quiet machine): from now on any "
+                              "matched pattern counts as NEW.")
+                except (OSError, RuntimeError) as e:
+                    failed = True
+                    print(f"{Fore.RED}Baseline not saved: {e}{Style.RESET_ALL}", file=sys.stderr)
         else:
             if args.quiet and noise_line:
                 print(noise_line)

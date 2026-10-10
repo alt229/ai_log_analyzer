@@ -248,6 +248,37 @@ Suggested workflow (Mac `andromeda`):
    `python3 main.py --local -t 2h --ai claude --ai-changes-only --quiet`.
    `--report-noise` shows what is normal, what changed, and the ids to filter.
 
+## Proxmox LXC containers (`--guest`)
+
+On a Proxmox host, ai_logs can read the journal of each LXC container
+through the host, with `pct exec`: no SSH keys or network access into the
+containers are needed, but `--user` must be root on the host.
+
+```bash
+# One container (id from `pct list`)
+python3 main.py --host halley.root-cervers.net --user root --key ~/.ssh/id_rsa_ansible --guest 48253 -t 1h --quiet
+
+# Every running container, one after another (same options for each)
+python3 main.py --host halley.root-cervers.net --user root --key ~/.ssh/id_rsa_ansible --guest all -t 1h --save-baseline --quiet
+python3 main.py --host halley.root-cervers.net --user root --key ~/.ssh/id_rsa_ansible --guest all -t 1h --ai-changes-only --ai claude --quiet
+```
+
+- Each container is its own target: hosts.json name `HOST/ctID`, matched by
+  the container's machine-id, folder named after its host name (`pihole`,
+  `vatican`, ...; else `HOST-ctID`). So it has its own `noise.yaml` and
+  baseline. If you later SSH to the same container directly, the
+  machine-id finds the same folder.
+- `--guest all` lists running containers (`pct list`) and runs main.py once
+  per container, with a `===== HOST CT ID (name) =====` header each. Exit 1
+  if any of them failed (e.g. a container without journald).
+- The SSH host key check is the Proxmox host's. Run the host once without
+  `--guest` first so its key is recorded; a changed key is accepted on a
+  run without `--guest`.
+- A run with no matched patterns (a quiet container) now saves a 0-pattern
+  baseline, so `--ai-changes-only` works for it: any pattern later is NEW.
+- Not with `--docker`; `--guest all` not with `-o` or `--status-file`.
+- VMs are not covered (they need the QEMU guest agent or plain SSH).
+
 ## Claude options
 
 - `--model`: `sonnet` (default, `claude-sonnet-5-5`), `opus`
