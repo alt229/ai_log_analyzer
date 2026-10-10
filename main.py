@@ -20,6 +20,8 @@
 #   --local                  local Mac/Linux logs
 #   --host H [--user U] [--port 22] [--key FILE]   SSH to a remote host
 #                            (--user defaults to your local username)
+#   --accept-hostkey-change  with --host: accept a CHANGED SSH host key
+#                            for this run (after checking it) and record it
 #   --docker                 add Docker container logs (REQUIRES --host)
 #   --windows --win-host H   Windows Event Log via WMI
 # Time:  -t/--time DURATION: 90s, 15m, 2h, 1d, 1h30m (any case); a bare
@@ -81,6 +83,9 @@
 # to --win-host, HTTPS to the AI provider. Docker needs access to the
 # remote Docker socket. Credentials: SSH key/agent, Windows password or NTLM
 # hash, AI API keys. Config file: ~/.config/ai_logs/config.yaml.
+# --host reads (never writes) ~/.ssh/known_hosts and
+# /etc/ssh/ssh_known_hosts to check the server's host key; paramiko 3.2+
+# to ask for a recorded key type first (paramiko 5.0.0 in the venv).
 #
 # SIDE EFFECTS
 # - Creates ~/.config/ai_logs/ and config.yaml on first run of ANY command
@@ -110,6 +115,8 @@
 #   dates. --host runs ONE extra command over SSH for it (machine-id file
 #   or ioreg, hostname); --local reads the same here (ioreg on macOS).
 #   --rename-target renames a folder there. Nothing is deleted.
+#   --accept-hostkey-change: the new host key replaces the old key(s) of
+#   that type in hosts.json (old fingerprints kept in its history lines).
 # - Opens SSH / WMI connections to remote hosts; reads logs only (inferred).
 #
 # CAVEATS & GOTCHAS
@@ -223,8 +230,21 @@
 #   collection (log show / journalctl / SSH / docker error or non-zero exit)
 #   prints the command's own error on stderr. "No logs were collected" means
 #   the command worked and found nothing: a warning, exit 0.
-# - SSH uses paramiko AutoAddPolicy: any host key is accepted unchecked
-#   (collector.py, inferred).
+# - --host checks the SSH host key like ssh does, during the handshake,
+#   before logging in: a key in ~/.ssh/known_hosts ([host]:port for other
+#   ports; hashed names work) or in hosts.json for that name -> go on. A
+#   host known to neither -> accepted (like StrictHostKeyChecking=
+#   accept-new), one stderr note, recorded in hosts.json. A CHANGED key ->
+#   "WARNING: HOST KEY FOR ... HAS CHANGED" on stderr, exit 1, no login, no
+#   command, nothing written. Check it on the server (ssh-keygen -lf
+#   /etc/ssh/ssh_host_<type>_key.pub), then rerun with
+#   --accept-hostkey-change. known_hosts is never edited (ssh-keygen -R).
+# - Key types: the key types recorded for the host are asked for first, so
+#   a server with several keys shows a recorded one. If it offers none of
+#   those types any more, that counts as a change (refused). Keys recorded
+#   in hosts.json before 2026-10-09 have no type; a mismatch is a change.
+# - Not used from known_hosts: wildcard patterns, @cert-authority and
+#   @revoked lines, ssh-dss keys, ~/.ssh/config (HostKeyAlias etc.).
 # - analyzer.py's "success" ignore pattern also matches "unsuccessful", so
 #   such error lines can be silently dropped (regex check by reviewer).
 # - Config 'default_settings' (color, summary, max_examples) exist in
@@ -258,7 +278,8 @@
 # (always plain text, no colour codes). Exit 0 on success/help/config
 # commands; 2 on bad arguments (checked before collecting); 1 on fatal
 # errors, a missing AI key, a cancelled --reset-config, a refused
-# --set-api-key, or if any log collection, AI, Windows or Docker step failed.
+# --set-api-key, a refused (changed) SSH host key, or if any log
+# collection, AI, Windows or Docker step failed.
 # --status-file PATH: JSON {"time", "target", "severity" (low|medium|high|
 # critical|null), "severity_source" (ai|heuristic|null), "ai_called",
 # "ai_skipped_reason", "new", "spike", "lines" (processed, after noise
@@ -281,6 +302,9 @@
 #   machine-id / SSH host key is checked right after connecting, before
 #   the baseline and noise.yaml are read); --list-targets, --rename-target
 #   (hostid.patch).
+# 2026-10-09 - Script Wrangler: SSH host key check (known_hosts read only +
+#   hosts.json) replaces paramiko AutoAddPolicy: a changed key stops the
+#   run (exit 1) before login; --accept-hostkey-change (hostkey.patch).
 #-----------------------------------------------------------------------------
 # Header written 2026-10-08 by Script Wrangler (Claude). Last test then:
 # PASS-STATIC. Items marked (inferred) come from reading the code, not from
@@ -673,6 +697,11 @@ Examples:
     remote_group.add_argument('--user', help='SSH username for remote host (default: your local username)')
     remote_group.add_argument('--port', type=int, default=22, help='SSH port (default: 22)')
     remote_group.add_argument('--key', help='Path to SSH private key file')
+    remote_group.add_argument('--accept-hostkey-change', action='store_true',
+                              help='The SSH host key of --host changed and you checked it on the '
+                                   'server: accept it for this run and record it in hosts.json '
+                                   '(replaces the old key of that type). Never edits '
+                                   '~/.ssh/known_hosts')
 
     # Output options
     output_group = parser.add_argument_group('output options')
@@ -1120,6 +1149,8 @@ def _main():
         args.user = getpass.getuser()
     if args.docker and not args.host:
         parser.error('--docker requires --host (Docker logs are read over SSH)')
+    if args.accept_hostkey_change and not args.host:
+        parser.error('--accept-hostkey-change needs --host')
     if args.windows and not args.win_host:
         parser.error('--win-host is required when using --windows')
     if args.deep_dive is not None:
@@ -1180,12 +1211,19 @@ def _main():
     # --host connects here, before the baseline and noise.yaml are read, and
     # sends its machine-id and SSH host key (get_logs() reuses the connection);
     # --local reads its id locally. --baseline-info only looks the name up.
+    # A changed SSH host key is refused while connecting (before login; the
+    # collector prints the warning): stop here, nothing read or written.
     collector = LogCollector(host=args.host, user=args.user, port=args.port, key_file=args.key)
+    collector.accept_hostkey_change = args.accept_hostkey_change
     if target:
         try:
             ident = None if args.baseline_info else collector.identify()
         except KeyboardInterrupt:   # e.g. at the SSH key passphrase prompt
             print("\nAnalysis interrupted by user")
+            sys.exit(1)
+        if getattr(collector, 'hostkey_refused', False):
+            print(f"{Fore.RED}Stopped: SSH host key of {args.host} not accepted (warning above); "
+                  f"nothing was collected.{Style.RESET_ALL}", file=sys.stderr)
             sys.exit(1)
         target, notes = target_store.resolve_target(args.host or target, target, ident)
         for note in notes:

@@ -23,6 +23,7 @@
 #   atomic_write(os.path.join(d, 'noise.yaml'), text)
 #   folder, notes = resolve_target(name_typed, t, ident)   (notes: stderr)
 #       ident = collector.identify() (dict); None = name lookup only
+#   keys, problem = recorded_hostkeys(name_typed)   (collector's key check)
 #   text, status = list_targets()        ok, msg = rename_target(old, new)
 #
 # REQUIRES
@@ -37,7 +38,10 @@
 # the target (mode 600). Nothing is ever deleted: if a write fails, the
 # temp file stays and its name is in the error.
 # resolve_target() rewrites hosts.json (same way) when something changed:
-# new machine or name, new host key, a new last_seen day. An unreadable
+# new machine or name, new host key or key type, a new last_seen day.
+# With --accept-hostkey-change the new key REPLACES the entry's keys of
+# the same type (and those with no type recorded); the old fingerprints
+# stay in the entry's history lines. An unreadable
 # hosts.json is first copied to hosts.json.bad-YYYYmmdd-HHMMSS (a new
 # file, never overwritten) and a stderr line says so. rename_target()
 # renames one folder (os.rename) and its entry; never if NEW exists.
@@ -55,7 +59,11 @@
 #   NAME-2 ...) and a WARNING line. Copy noise.yaml over by hand if it is
 #   the same server reinstalled.
 # - VM clones that kept the same /etc/machine-id look like ONE machine
-#   (each new host key gets a note). Give clones a new machine-id.
+#   (each new host key gets a note). Give clones a new machine-id: one
+#   entry's --accept-hostkey-change would drop the other clone's key.
+# - collector.py trusts the keys recorded here for the NAME used (--host
+#   as typed). A known machine under a new name or IP is a new host for
+#   that check (as with ssh); hosts.json then adds the name to it.
 # - Renaming the Mac changes LocalHostName; hosts.json still finds the
 #   old folder by machine-id and adds the new name as an alias.
 # - hosts.json holds machine-ids (unique per machine): private, mode 600.
@@ -67,6 +75,10 @@
 # 2026-10-09 - Script Wrangler: hosts.json maps each machine (machine-id /
 #   SSH host key) to one folder: resolve_target, list_targets,
 #   rename_target, local_identity, parse_identity (hostid.patch).
+# 2026-10-09 - Script Wrangler: hosts.json's host keys are also trusted keys
+#   for collector.py's host key check (recorded_hostkeys); each key's type
+#   is recorded (hostkey_types); --accept-hostkey-change replaces the old
+#   key(s) of that type (hostkey.patch).
 #=============================================================================
 import json
 import os
@@ -310,6 +322,26 @@ def _hostkeys(e):
     return [x for x in k if isinstance(x, str)] if isinstance(k, list) else []
 
 
+def _hostkey_types(e):
+    t = e.get('hostkey_types')   # {fingerprint: key type}, since hostkey.patch
+    return {k: v for k, v in t.items() if isinstance(v, str)} if isinstance(t, dict) else {}
+
+
+def recorded_hostkeys(name, path=None):
+    """Host keys hosts.json has for the machine reached as name (--host as
+    typed), read only: ([(key type or None, fingerprint, where)], problem).
+    Type None = recorded before key types were. [] if the name is unknown;
+    problem = why hosts.json is unreadable, else None."""
+    path = path or registry_path()
+    reg, problem = _load(path)
+    alias = alias_key(name)
+    for f, e in reg['machines'].items():
+        if alias in _aliases(e):
+            types = _hostkey_types(e)
+            return [(types.get(k), k, f"{path}, folder {f}") for k in _hostkeys(e)], problem
+    return [], problem
+
+
 def _has_id(e):
     return bool(e.get('machine_id') or _hostkeys(e))
 
@@ -342,9 +374,10 @@ def _short(text, n=12):
     return (text[:n] + '...') if text and len(text) > n else (text or '-')
 
 
-def _match(reg, alias, name, default, mid, hk, hostname, today):
+def _match(reg, alias, name, default, mid, hk, hostname, today, kt=None, replace=False):
     """The decision behind resolve_target(), done on a freshly read registry
-    (changed in place). Returns (folder, notes)."""
+    (changed in place). kt = hk's key type; replace = --accept-hostkey-change.
+    Returns (folder, notes)."""
     machines = reg['machines']
     by_alias = next((f for f, e in machines.items() if alias in _aliases(e)), None)
     folder = how = None
@@ -384,8 +417,18 @@ def _match(reg, alias, name, default, mid, hk, hostname, today):
             if by_alias and by_alias != folder:
                 parts.append(f"{name} belonged to {by_alias} before")
             _log(e, today, f"name {alias} added ({how})")
+        old = []
+        if hk and replace:      # --accept-hostkey-change: hk replaces the keys of its type
+            types = _hostkey_types(e)
+            old = [k for k in _hostkeys(e) if k != hk and types.get(k) in (kt, None)]
+            if old:
+                e['hostkeys'] = [k for k in _hostkeys(e) if k not in old]
+                e['hostkey_types'] = {k: v for k, v in types.items() if k not in old}
+                parts.append(f"{folder}: SSH host key {_short(hk, 19)} replaces "
+                             f"{', '.join(_short(k, 19) for k in old)} (--accept-hostkey-change)")
+                _log(e, today, f"host key change accepted: {hk} replaces {', '.join(old)}")
         if hk and hk not in _hostkeys(e):
-            if _hostkeys(e):
+            if _hostkeys(e) and not old:
                 parts.append(f"{folder}: new SSH host key {_short(hk, 19)} recorded ({how})")
                 _log(e, today, f"new SSH host key {hk} ({how})")
             e['hostkeys'] = _hostkeys(e) + [hk]
@@ -413,6 +456,10 @@ def _match(reg, alias, name, default, mid, hk, hostname, today):
                                 'hostname': hostname, 'aliases': {}, 'first_seen': today}
         _log(e, today, f"registered as {alias}" + (f" ({parts[0]})" if parts[0].startswith('WARNING')
                                                    else ''))
+    if hk and kt:   # the next connection asks for this key type first (collector.py)
+        types = _hostkey_types(e)
+        types[hk] = kt
+        e['hostkey_types'] = types
     if hostname:
         e['hostname'] = hostname
     _seen(e, alias, today)
@@ -425,7 +472,8 @@ def resolve_target(name, default, ident=None, path=None, today=None):
     (host_target(name) or local_target()). ident = collector.identify():
     {'machine_id', 'hostkey', 'hostname', 'error'}; None = not looked up
     (--baseline-info: no connection), then only the name is looked up and
-    nothing is written. Returns (folder, notes); notes are stderr lines."""
+    nothing is written. ident may also hold 'hostkey_type' and
+    'hostkey_replace' (see _match). Returns (folder, notes); notes are stderr lines."""
     path = path or registry_path()
     alias = alias_key(name) or default
     mid = (ident or {}).get('machine_id') or None
@@ -440,7 +488,8 @@ def resolve_target(name, default, ident=None, path=None, today=None):
         return folder, notes
     (folder, notes), more, _ok = _update(
         lambda reg: _match(reg, alias, name, default, mid, hk, (ident or {}).get('hostname'),
-                           today or time.strftime('%Y-%m-%d')), path)
+                           today or time.strftime('%Y-%m-%d'), (ident or {}).get('hostkey_type'),
+                           bool((ident or {}).get('hostkey_replace'))), path)
     return folder, more + notes   # hosts.json problems first
 
 
