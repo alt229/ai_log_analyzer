@@ -22,6 +22,8 @@
 #                            (--user defaults to your local username)
 #   --accept-hostkey-change  with --host: accept a CHANGED SSH host key
 #                            for this run (after checking it) and record it
+#   --platform NAME          linux or darwin: skip OS detection (default
+#                            auto: SSH banner + one probe command)
 #   --guest ID|all           with --host on a Proxmox host (as root): the logs
 #                            of LXC container ID (pct exec) instead of the
 #                            host's; all = each running container in turn
@@ -310,6 +312,11 @@
 # ORIGIN / HISTORY
 # No author, version or date in the file (line 2 is just "# main.py").
 # History:
+# 2026-10-10 - Script Wrangler: the OS of --host is detected (platforms/:
+#   linux = journalctl, darwin = log show); --platform overrides it. A
+#   remote Mac now works (it got journalctl before); an unsupported OS
+#   (FreeBSD, pfSense, RouterOS, Linux without journald) stops with a clear
+#   error, exit 1 (platforms.patch).
 # 2026-10-10 - Script Wrangler: --guest ID|all reads a Proxmox LXC
 #   container's journal through the host (pct exec); each container is its
 #   own target (machine-id, folder named after its host name); all = one
@@ -350,6 +357,7 @@ from config import Config
 import noise_filters as nf
 import baseline as bl
 import target_store
+import platforms
 from log_dedup import level_label, merge_same, patterns_suffix
 
 # Env vars the providers in ai_providers.py already fall back to
@@ -786,6 +794,10 @@ Examples:
                                    'server: accept it for this run and record it in hosts.json '
                                    '(replaces the old key of that type). Never edits '
                                    '~/.ssh/known_hosts')
+    remote_group.add_argument('--platform', choices=['auto'] + platforms.names(), default='auto',
+                              help='OS of the target: auto (default) detects it from the SSH '
+                                   'banner and one probe command; linux = journalctl, darwin = '
+                                   'macOS log show')
     remote_group.add_argument('--guest', metavar='ID|all',
                               help='Proxmox host only (--user root): analyze LXC container ID '
                                    '(pct exec) instead of the host; "all" = every running '
@@ -1320,6 +1332,8 @@ def _main():
     # collector prints the warning): stop here, nothing read or written.
     collector = LogCollector(host=args.host, user=args.user, port=args.port, key_file=args.key)
     collector.accept_hostkey_change = args.accept_hostkey_change
+    if args.platform != 'auto':
+        collector.platform_forced = args.platform
     if args.guest == 'all':
         sys.exit(run_all_guests(collector, args))
     if args.guest:

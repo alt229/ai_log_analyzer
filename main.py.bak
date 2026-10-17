@@ -1,0 +1,901 @@
+#!/usr/bin/env python3
+#=============================================================================
+# main.py - Entry point of ai_logs: collect system logs (local, SSH, Docker, Windows) and optionally get AI analysis
+#=============================================================================
+#
+# WHAT IT DOES
+# Command-line front end for the multi-file ai_logs tool. It gathers logs
+# from this machine (--local), a remote Linux/Mac host over SSH (--host),
+# Docker containers on that host (--docker), or a remote Windows machine's
+# Event Log over WMI (--windows). Lines are grouped and filtered by severity
+# by LogAnalyzer, printed (or written to a file / JSON), and can then be sent
+# to Claude, Gemini or ChatGPT for a summary. An optional "deep dive" asks
+# the AI to investigate chosen numbered issues from that summary. main.py
+# itself only parses arguments, wires the sibling modules together, and
+# formats the AI's markdown-ish reply for the terminal.
+#
+# USAGE
+# python3 main.py                 (no args: prints help, exit 0)
+# Scan target (at least one needed, else a warning + help + exit 1):
+#   --local                  local Mac/Linux logs
+#   --host H [--user U] [--port 22] [--key FILE]   SSH to a remote host
+#   --docker                 add Docker container logs (REQUIRES --host)
+#   --windows --win-host H   Windows Event Log via WMI
+# Time:  -t/--time HOURS (float, default 1) - local/SSH/Docker only.
+# Output: --no-color  --json  --full  -o/--output FILE  --debug  --summary
+# Severity: --only-errors | --only-warnings | --only-info ; or
+#   --ignore {info,warnings,errors} [...]
+# AI: --ai {claude,gemini,chatgpt}  --api-key KEY  --max-examples N (3)
+#   --system-info FILE.json  --compare (all providers that have a stored key)
+#   --deep-dive [N ...]   no numbers = ask interactively after analysis;
+#                         numbers = investigate those issues without asking
+# Docker: --container NAME  --no-container-stats  --docker-socket PATH
+# Windows: --win-user (Administrator)  --win-password  --win-domain
+#   --win-hashes LM:NT  --win-time {hour,day,week,month,all} (month)
+#   --win-logs LOG [...] (System Application Security)
+#   --win-level {critical,error,warning,information,all} (warning)
+#   --win-show-noisy  --win-max-events N (5000 per channel)
+# Config (act then exit 0, no scanning):
+#   --set-api-key PROVIDER KEY   --show-config   --reset-config
+#
+# REQUIRES
+# Python 3 (run with the alt229-dev venv: colorama is only there). Sibling
+# modules in the same folder (found via sys.path): collector, analyzer,
+# ai_providers, local_insights, config, plus docker_collector,
+# windows_collector, windows_analyzer loaded on demand. config.py needs
+# PyYAML (inferred from its import). --windows needs impacket (inferred
+# from the error message); --ai needs anthropic, google-genai, openai
+# (install message at the end of the file). Network: SSH to --host, WMI/SMB
+# to --win-host, HTTPS to the AI provider. Docker needs access to the
+# remote Docker socket. Credentials: SSH key/agent, Windows password or NTLM
+# hash, AI API keys. Config file: ~/.config/ai_logs/config.yaml.
+#
+# SIDE EFFECTS
+# - Creates ~/.config/ai_logs/ and config.yaml on first run of ANY command
+#   (Config() is built before anything else).
+# - --set-api-key writes the key in plain text into config.yaml.
+# - --reset-config DELETES config.yaml (including all stored API keys) and
+#   recreates the defaults.
+# - -o/--output: the analyzer writes its report there, and AI output and
+#   deep-dive text are APPENDED to the same file.
+# - Sends collected log text (and --system-info / Docker stats) to the
+#   chosen third-party AI provider (inferred from ai_providers use).
+# - Opens SSH / WMI connections to remote hosts; reads logs only (inferred).
+#
+# CAVEATS & GOTCHAS
+# - --reset-config wipes stored API keys with no confirmation.
+# - --docker only works together with --host; --docker alone exits 1.
+#   Docker lines are fed into the same analyzer as the SSH logs.
+# - -t/--time does not affect Windows; use --win-time. The Windows scan
+#   defaults to a whole month at level warning.
+# - --win-password on the command line is visible in ps/shell history. If
+#   neither password nor hashes is given you are prompted (getpass, safe).
+#   Secrets are handled at lines 488, 499, 568 (variables, no literals).
+# - --deep-dive only runs with a single --ai provider, not --compare.
+#   Prompt (input(), line 694) accepts numbers, "all" (= 1-5), or Enter/q to
+#   finish; it loops until you quit. Piped/EOF stdin ends it.
+# - --ai without --api-key uses ONLY the key stored in config.yaml. Env vars
+#   (ANTHROPIC_API_KEY etc.) are NOT honoured by main.py: it exits 1 "No API
+#   key found" (--compare silently skips the provider), even though
+#   ai_providers.py's message suggests env vars (inferred). Use --set-api-key.
+# - --json, --summary and --max-examples currently have no effect: the
+#   analyzer ignores them (inferred from code reading).
+# - Without --ai, Docker findings are never printed: the analyzer prints its
+#   report before the Docker lines are added; they only reach the AI (inferred).
+# - --deep-dive N ... still shows the interactive prompt after the first
+#   round, contrary to the help text (seen in a reimplementation of the logic).
+# - If no log data was collected the AI step is skipped, not failed.
+# - When only --windows is used, the Windows text summary is what is sent
+#   to the AI; with --local/--host too, it is attached to the analyzer.
+# - --ignore warnings works by stripping a trailing "s" from the word.
+# - Most errors are printed and the script carries on; AI, Windows and Docker
+#   failures still exit 0 (inferred). Exit 1 on Ctrl-C. A Windows failure
+#   does not stop later steps.
+# - SSH uses paramiko AutoAddPolicy: any host key is accepted unchecked
+#   (collector.py, inferred).
+# - analyzer.py's "success" ignore pattern also matches "unsuccessful", so
+#   such error lines can be silently dropped (regex check by reviewer).
+# - Config 'default_settings' (color, summary, max_examples) exist in
+#   config.yaml but main.py never reads them (inferred from this file).
+# - config.py: if config.yaml is unparseable, _load_config calls itself:
+#   ~1000 "Error loading config" lines, then RecursionError; main.py exits 1.
+#   Bounded, not endless (seen in a reimplementation, not the real code).
+# - config.yaml holds API keys in plain text and is created with default
+#   permissions (observed -rw-r--r--). Suggest: chmod 600 it.
+# - The epilog examples say "python main.py"; use python3 / the venv.
+# - Help text says Windows via "WMI"; also uses SMB for OS detection.
+#
+# EXAMPLES
+# python3 main.py --local -t 1 --only-errors
+#   Last hour of local logs, errors only.
+# python3 main.py --host server1 --user admin --key ~/.ssh/id_ed25519 -t 6 --docker --ai claude
+#   Six hours over SSH incl. Docker logs, then AI summary.
+# python3 main.py --windows --win-host 192.168.1.50 --win-user Administrator --win-time day --win-level error --ai claude --deep-dive 1 3
+#   Windows errors from the last day, AI summary, auto deep-dive on 1 and 3.
+#
+# INPUTS / OUTPUTS
+# Input: live logs; optional --system-info JSON file; config.yaml.
+# Output: coloured terminal report (or --json), optional -o file. Exit 0 on
+# success/help/config commands, 1 on bad arguments or fatal errors.
+#
+# STATUS
+# Triage result was static-only. Syntax is OK under the venv. Not run: the sandbox
+# refused because sibling files match dangerous patterns (config.py,
+# file removal in reset_config; Windows event-ID strings in windows_analyzer).
+# The check tool's "missing module" list is a false positive: those are
+# sibling files. Behaviour above is from reading main.py and config.py;
+# other siblings were not read, so their details are (inferred).
+#
+# ORIGIN / HISTORY
+# No author, version or date in the file (line 2 is just "# main.py").
+#-----------------------------------------------------------------------------
+# Header written 2026-10-08 by Script Wrangler (Claude). Last test then:
+# PASS-STATIC. Items marked (inferred) come from reading the code, not from
+# running it.
+#=============================================================================
+# main.py
+import argparse
+import sys
+import os
+import re
+import json
+import shutil
+from dataclasses import dataclass
+from typing import Optional, Dict, List
+from colorama import Fore, Style
+
+# Add the current directory to the Python path
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+from collector import LogCollector
+from analyzer import LogAnalyzer
+from ai_providers import get_ai_provider
+from local_insights import LocalInsights
+from config import Config
+
+def create_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description='Advanced log analyzer for system logs',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    # Analyze local Mac/Linux logs for the last hour
+    python main.py --local -t 1
+
+    # Local logs, errors only
+    python main.py --local -t 1 --only-errors
+
+    # Remote Linux via SSH
+    python main.py --host server1.example.com --user admin --key ~/.ssh/id_ed25519 -t 6
+
+    # Remote Windows via WMI (prompts for password)
+    python main.py --windows --win-host 192.168.1.50 --win-user Administrator
+
+    # Remote Windows, last day, errors only, with AI summary
+    python main.py --windows --win-host 192.168.1.50 --win-user Administrator --win-time day --win-level error --ai claude
+
+    # AI analysis
+    python main.py --local -t 1 --ai claude
+    python main.py --local -t 1 --ai gemini
+    python main.py --local -t 1 --ai chatgpt
+
+    # Deep dive — prompts interactively after analysis
+    python main.py --windows --win-host 192.168.1.50 --win-user Administrator --ai claude --deep-dive
+
+    # Deep dive — auto investigate issues 1 and 3 without prompting
+    python main.py --windows --win-host 192.168.1.50 --win-user Administrator --ai claude --deep-dive 1 3
+        """)
+
+
+    # Time window options
+    parser.add_argument('-t', '--time', type=float, default=1,
+                      help='Number of hours to look back (default: 1)')
+
+    # Scan target — at least one required
+    target_group = parser.add_argument_group('scan target (choose one or more)')
+    target_group.add_argument('--local', action='store_true',
+                          help='Analyze logs on the local Mac/Linux machine')
+
+    # Remote connection options
+    remote_group = parser.add_argument_group('remote connection options (SSH — Linux/Mac)')
+    remote_group.add_argument('--host', help='Remote host to analyze logs from')
+    remote_group.add_argument('--user', help='SSH username for remote host')
+    remote_group.add_argument('--port', type=int, default=22, help='SSH port (default: 22)')
+    remote_group.add_argument('--key', help='Path to SSH private key file')
+
+    # Output options
+    output_group = parser.add_argument_group('output options')
+    output_group.add_argument('--no-color', action='store_true', help='Disable colored output')
+    output_group.add_argument('--json', action='store_true', help='Output results as JSON')
+    output_group.add_argument('--full', action='store_true', help='Show full messages without truncation')
+    output_group.add_argument('-o', '--output', help='Write output to file')
+    output_group.add_argument('--debug', action='store_true', help='Show debug information')
+    output_group.add_argument('--summary', action='store_true', help='Show summarized output')
+
+    # Severity filter options
+    filter_group = parser.add_argument_group('severity filter options')
+    filter_group.add_argument('--only-errors', action='store_true',
+                          help='Show only error messages')
+    filter_group.add_argument('--only-warnings', action='store_true',
+                          help='Show only warning messages')
+    filter_group.add_argument('--only-info', action='store_true',
+                          help='Show only info messages')
+    filter_group.add_argument('--ignore', nargs='+', choices=['info', 'warnings', 'errors'],
+                          help='Ignore specific message types')
+
+    # AI analysis options
+    ai_group = parser.add_argument_group('AI analysis options')
+    ai_group.add_argument('--ai', metavar='PROVIDER',
+                       help='Enable AI analysis using specified provider (claude, gemini, or chatgpt)')
+    ai_group.add_argument('--max-examples', type=int, default=3,
+                       help='Maximum number of examples per error group to send to AI (default: 3)')
+    ai_group.add_argument('--api-key', help='API key for chosen AI provider')
+    ai_group.add_argument('--system-info', help='Path to JSON file containing system information')
+    ai_group.add_argument('--compare', action='store_true',
+                       help='Compare analyses from all configured AI providers')
+    ai_group.add_argument('--deep-dive', nargs='*', metavar='N',
+                       help='Deep dive on top issues. No args = prompt interactively after '
+                            'analysis. Pass issue numbers to skip the prompt, e.g. --deep-dive 1 3')
+                       
+    config_group = parser.add_argument_group('configuration options')
+    config_group.add_argument('--set-api-key', nargs=2, metavar=('PROVIDER', 'KEY'),
+                          help='Set API key for specified provider')
+    config_group.add_argument('--show-config', action='store_true',
+                          help='Show current configuration')
+    config_group.add_argument('--reset-config', action='store_true',
+                          help='Reset configuration to defaults')
+                          
+    # Docker options
+    docker_group = parser.add_argument_group('docker options')
+    docker_group.add_argument('--docker', action='store_true',
+                          help='Include Docker container logs')
+    docker_group.add_argument('--container',
+                          help='Specific container to analyze (default: all)')
+    docker_group.add_argument('--no-container-stats', action='store_true',
+                          help='Skip container stats collection')
+    docker_group.add_argument('--docker-socket',
+                          help='Path to Docker socket (default: /var/run/docker.sock)')
+
+    # Windows Event Log options
+    win_group = parser.add_argument_group('windows event log options')
+    win_group.add_argument('--windows', action='store_true',
+                       help='Analyze Windows Event Log on a remote host via WMI')
+    win_group.add_argument('--win-host',
+                       help='Windows host IP or hostname (required with --windows)')
+    win_group.add_argument('--win-user', default='Administrator',
+                       help='Windows username (default: Administrator)')
+    win_group.add_argument('--win-password', default='',
+                       help='Windows password')
+    win_group.add_argument('--win-domain', default='',
+                       help='Windows domain (leave blank for local accounts)')
+    win_group.add_argument('--win-hashes',
+                       help='NTLM hash auth in LM:NT format (alternative to password)')
+    win_group.add_argument('--win-time',
+                       choices=['hour', 'day', 'week', 'month', 'all'],
+                       default='month',
+                       help='How far back to look (default: month)')
+    win_group.add_argument('--win-logs', nargs='+',
+                       default=['System', 'Application', 'Security'],
+                       metavar='LOG',
+                       help='Event log channels to query (default: System Application Security)')
+    win_group.add_argument('--win-level',
+                       choices=['critical', 'error', 'warning', 'information', 'all'],
+                       default='warning',
+                       help='Minimum event level to collect (default: warning)')
+    win_group.add_argument('--win-show-noisy', action='store_true',
+                       help='Include events from known noisy/benign sources')
+    win_group.add_argument('--win-max-events', type=int, default=5000,
+                       help='Max events per log channel (default: 5000)')
+
+
+    return parser
+
+
+
+def _render_md_table(lines: list) -> list:
+    """Convert markdown pipe-table lines into aligned terminal output."""
+    # Parse rows
+    rows = []
+    for line in lines:
+        cells = [c.strip() for c in line.strip().strip('|').split('|')]
+        rows.append(cells)
+
+    # Remove separator row (all dashes)
+    rows = [r for r in rows if not all(re.match(r'^[-:]+$', c) for c in r)]
+
+    if not rows:
+        return []
+
+    # Calculate column widths
+    ncols = max(len(r) for r in rows)
+    rows  = [r + [''] * (ncols - len(r)) for r in rows]  # pad short rows
+    widths = [max(len(r[i]) for r in rows) for i in range(ncols)]
+
+    out = []
+    term_w = shutil.get_terminal_size((120, 40)).columns
+
+    for idx, row in enumerate(rows):
+        cells = [row[i].ljust(widths[i]) for i in range(ncols)]
+        line  = '  ' + ' │ '.join(cells)
+        if idx == 0:
+            out.append(Fore.CYAN + line + Style.RESET_ALL)
+            out.append('  ' + '─┼─'.join('─' * w for w in widths))
+        else:
+            out.append(line)
+    return out
+
+
+def _format_section_body(body: str) -> list:
+    """Format the body of one section, handling tables, bullets, code, numbered items."""
+    out   = []
+    lines = body.split('\n')
+    i     = 0
+
+    # Collect consecutive pipe-table lines
+    table_buf = []
+
+    def flush_table():
+        if table_buf:
+            out.extend(_render_md_table(table_buf))
+            table_buf.clear()
+
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        # Markdown table row
+        if stripped.startswith('|') and stripped.endswith('|'):
+            table_buf.append(stripped)
+            i += 1
+            continue
+        else:
+            flush_table()
+
+        if not stripped:
+            i += 1
+            continue
+
+        # Horizontal rule — skip entirely
+        if re.match(r'^[-*_]{3,}$', stripped):
+            i += 1
+            continue
+
+        # Markdown headers (## Step 1, ### Details etc) — render as a plain label
+        m_hdr = re.match(r'^#{1,4}\s+(.*)', stripped)
+        if m_hdr:
+            text = re.sub(r'\*\*(.*?)\*\*', r'\1', m_hdr.group(1))
+            out.append(f"\n{Fore.CYAN}  {text}{Style.RESET_ALL}")
+            i += 1
+            continue
+
+        # Blockquote lines (> text) — render as indented note
+        if stripped.startswith('>'):
+            text = re.sub(r'\*\*(.*?)\*\*', r'\1', stripped.lstrip('> ').strip())
+            if text:
+                out.append(f"{Fore.WHITE}{Style.DIM}  ▌ {text}{Style.RESET_ALL}")
+            i += 1
+            continue
+
+        # Code block fence
+        if stripped.startswith('```'):
+            lang = stripped[3:].strip()
+            i += 1
+            code_lines = []
+            while i < len(lines) and not lines[i].strip().startswith('```'):
+                code_lines.append(lines[i])
+                i += 1
+            i += 1  # skip closing fence
+            out.append(Fore.WHITE + Style.DIM + f'  ┌─ {lang or "code"} ' + '─' * max(0, 50 - len(lang)) + Style.RESET_ALL)
+            for cl in code_lines:
+                out.append(Fore.WHITE + Style.DIM + f'  │ {cl}' + Style.RESET_ALL)
+            out.append(Fore.WHITE + Style.DIM + '  └' + '─' * 52 + Style.RESET_ALL)
+            continue
+
+        # Bullet
+        if stripped.startswith(('-', '•', '*')) and not stripped.startswith('**'):
+            text = re.sub(r'\*\*(.*?)\*\*', r'\1', stripped.lstrip('-•* '))
+            out.append(f"{Fore.YELLOW}  • {text}{Style.RESET_ALL}")
+            i += 1
+            continue
+
+        # Numbered item
+        m = re.match(r'^(\d+)\.\s+(.*)', stripped)
+        if m:
+            num, text = m.group(1), m.group(2)
+            text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+            out.append(f"{Fore.GREEN}  {num}. {text}{Style.RESET_ALL}")
+            i += 1
+            continue
+
+        # Plain line — strip **bold** markers
+        plain = re.sub(r'\*\*(.*?)\*\*', r'\1', stripped)
+        out.append(f'  {plain}')
+        i += 1
+
+    flush_table()
+    return out
+
+
+def format_ai_recommendations(recommendations: Dict) -> str:
+    """Format AI recommendations for clean terminal display."""
+    output = []
+
+    output.append('\n' + '=' * 70)
+    output.append(f"{Fore.GREEN}🔍 AI Analysis Results{Style.RESET_ALL}")
+    output.append('=' * 70)
+
+    severity = recommendations.get('severity', 'unknown').upper()
+    sev_fmt = {
+        'CRITICAL': (Fore.RED,    '🔴'),
+        'WARNING':  (Fore.YELLOW, '⚠️ '),
+        'INFO':     (Fore.BLUE,   'ℹ️ '),
+    }.get(severity, (Fore.WHITE, '❔'))
+    output.append(f"\n{sev_fmt[0]}Severity: {sev_fmt[1]} {severity}{Style.RESET_ALL}")
+
+    summary = recommendations.get('summary', '')
+    if not summary:
+        return '\n'.join(output)
+
+    section_icons = {
+        'Overall Assessment': '📊',
+        'Critical Issues':    '🚨',
+        'Service Issues':     '🔧',
+        'Recommendations':    '💡',
+        'Preventive Measures':'🛡️',
+        # Deep dive sections
+        'Root Cause':         '🔍',
+        'Remediation Steps':  '🔧',
+        'Verification':       '✅',
+        'Documentation':      '📚',
+        'Risks and Caveats':  '⚠️ ',
+    }
+
+    # Split on === markers
+    parts = re.split(r'===\s*(.*?)\s*===', summary)
+    # parts: [preamble, title1, body1, title2, body2, ...]
+    if len(parts) < 3:
+        # Fallback: just print raw
+        for line in summary.split('\n'):
+            output.append(f'  {line}')
+        return '\n'.join(output)
+
+    # Skip any preamble (parts[0])
+    it = iter(parts[1:])
+    for title in it:
+        body = next(it, '')
+        if not title.strip():
+            continue
+        icon = section_icons.get(title.strip())
+        if icon is None:
+            # Partial match for "Issue 1: Some Title", "Root Cause", etc.
+            title_lower = title.strip().lower()
+            for key, val in section_icons.items():
+                if key.lower() in title_lower or title_lower.startswith(key.lower()[:6]):
+                    icon = val
+                    break
+            else:
+                icon = '📝'
+        output.append(f"\n{Fore.CYAN}=== {icon} {title.strip()} ==={Style.RESET_ALL}")
+        output.extend(_format_section_body(body))
+
+    return '\n'.join(output)
+
+
+def main():
+    parser = create_parser()
+    
+    # If no arguments, show help
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(0)
+        
+    args = parser.parse_args()
+    
+    # Initialize config
+    try:
+        config = Config()
+    except Exception as e:
+        print(f"{Fore.RED}Error initializing config: {str(e)}{Style.RESET_ALL}")
+        sys.exit(1)
+
+    # Handle configuration commands
+    if args.set_api_key:
+        provider, key = args.set_api_key
+        config.set_api_key(provider, key)
+        sys.exit(0)
+    
+    if args.show_config:
+        config.show_config()
+        sys.exit(0)
+        
+    if args.reset_config:
+        config.reset_config()
+        sys.exit(0)
+    
+    try:
+        # Setup collector
+        collector = LogCollector(
+            host=args.host,
+            user=args.user,
+            port=args.port,
+            key_file=args.key
+        )
+        
+        # Determine which severity levels to show
+        show_levels = set(['error', 'warning', 'info'])
+        
+        # Handle exclusive filters
+        if args.only_errors:
+            show_levels = {'error'}
+        elif args.only_warnings:
+            show_levels = {'warning'}
+        elif args.only_info:
+            show_levels = {'info'}
+            
+        # Handle ignore filters
+        if args.ignore:
+            for level in args.ignore:
+                # Convert 'warnings' to 'warning' if needed
+                level = level.rstrip('s')
+                if level in show_levels:
+                    show_levels.remove(level)
+
+        # Create analyzer instance
+        analyzer = LogAnalyzer(
+            use_color=not args.no_color,
+            output_file=args.output,
+            output_json=args.json,
+            show_full=args.full,
+            debug=args.debug,
+            show_levels=show_levels
+        )
+        
+        # Run standard log analysis (local or SSH — skip if Windows-only mode)
+        run_local_scan = args.local or (args.host is not None)
+        if not run_local_scan and not args.windows and not args.docker:
+            print(f"{Fore.YELLOW}No scan target specified. Use --local, --host, --windows, or --docker.{Style.RESET_ALL}")
+            parser.print_help()
+            sys.exit(1)
+
+        if run_local_scan:
+            analyzer.run(collector, hours=args.time)
+
+        # Handle Docker logs if requested
+        if args.docker:
+            if not args.host:
+                print(f"{Fore.RED}Error: Docker collection requires SSH host (--host){Style.RESET_ALL}")
+                sys.exit(1)
+                
+            try:
+                from docker_collector import RemoteDockerLogCollector
+                docker_config = config.get_docker_config()
+                
+                # Update config with command line socket path if provided
+                if args.docker_socket:
+                    docker_config['socket'] = args.docker_socket
+                
+                # Use the existing SSH connection from the collector
+                docker_collector = RemoteDockerLogCollector(collector.ssh, docker_config)
+                
+                # Get Docker logs
+                docker_logs = docker_collector.get_container_logs(
+                    hours=args.time,
+                    container_name=args.container if args.container else None
+                )
+                
+                if not docker_logs:
+                    print(f"{Fore.YELLOW}No Docker logs found{Style.RESET_ALL}")
+                else:
+                    # Get container stats if not disabled
+                    container_stats = None
+                    if not args.no_container_stats:
+                        container_stats = docker_collector.get_container_stats(
+                            container_name=args.container if args.container else None
+                        )
+                    
+                    # Analyze Docker logs
+                    for container, logs in docker_logs.items():
+                        print(f"\nAnalyzing logs for container: {container}")
+                        for line in logs:
+                            analyzer.analyze_line(line)
+                        
+                    # Add container stats to system info for AI analysis
+                    if container_stats and (args.ai or args.compare):
+                        if 'system_info' not in locals():
+                            system_info = {}
+                        system_info['docker'] = container_stats
+                        
+            except Exception as e:
+                print(f"{Fore.RED}Error collecting Docker logs: {str(e)}{Style.RESET_ALL}")
+                if args.debug:
+                    import traceback
+                    traceback.print_exc()
+
+        # Run Windows Event Log analysis if requested
+        if args.windows:
+            if not args.win_host:
+                print(f"{Fore.RED}Error: --win-host is required when using --windows{Style.RESET_ALL}")
+                sys.exit(1)
+
+            if not args.win_password and not args.win_hashes:
+                import getpass
+                args.win_password = getpass.getpass(f"Windows password for {args.win_user}@{args.win_host}: ")
+
+            try:
+                from windows_collector import WindowsEventCollector
+                from windows_analyzer import WindowsLogAnalyzer
+
+                print(f"\n{Fore.CYAN}Connecting to {args.win_host} via WMI...{Style.RESET_ALL}")
+
+                win_collector = WindowsEventCollector(
+                    host=args.win_host,
+                    username=args.win_user,
+                    password=args.win_password,
+                    domain=args.win_domain or '',
+                    hashes=args.win_hashes,
+                )
+
+                with win_collector:
+                    # Detect OS via SMB (fast, works before full WMI auth)
+                    os_caption = ''
+                    try:
+                        os_caption = win_collector.detect_os()
+                        if os_caption:
+                            print(f"{Fore.CYAN}Target OS: {os_caption}{Style.RESET_ALL}")
+                    except Exception:
+                        pass
+
+                    print(f"{Fore.CYAN}Collecting {args.win_time} of events "
+                          f"(level >= {args.win_level}) from: "
+                          f"{', '.join(args.win_logs)}{Style.RESET_ALL}")
+
+                    events = win_collector.get_events(
+                        logs=args.win_logs,
+                        time_window=args.win_time,
+                        level=args.win_level,
+                        max_events_per_log=args.win_max_events,
+                    )
+
+                    print(f"{Fore.GREEN}Collected {len(events)} events.{Style.RESET_ALL}")
+
+                    win_analyzer = WindowsLogAnalyzer(
+                        use_color=not args.no_color,
+                        show_full=args.full,
+                    )
+                    win_analyzer._os_caption = os_caption
+                    findings = win_analyzer.analyze(events)
+                    win_analyzer.print_report(
+                        findings,
+                        hide_noisy=not args.win_show_noisy,
+                    )
+
+                    # Feed into AI analysis if requested
+                    if args.ai or args.compare:
+                        # Inject Windows summary into analyzer results
+                        win_summary = win_analyzer.get_results_for_ai(
+                            max_examples=args.max_examples
+                        )
+                        # Append to the existing analyzer results
+                        analyzer._windows_summary = win_summary
+
+            except ImportError:
+                print(f"{Fore.RED}impacket is required for Windows support.{Style.RESET_ALL}")
+                print("Install with: pip install impacket")
+                if args.debug:
+                    import traceback; traceback.print_exc()
+            except Exception as e:
+                print(f"{Fore.RED}Windows collection error: {e}{Style.RESET_ALL}")
+                if args.debug:
+                    import traceback; traceback.print_exc()
+
+
+        # Run AI analysis if requested
+        if args.ai or args.compare:
+            valid_providers = ['claude', 'gemini', 'chatgpt']
+            
+            if args.ai and args.ai.lower() not in valid_providers:
+                print(f"\n{Fore.RED}Error: Invalid AI provider. Choose from: {', '.join(valid_providers)}{Style.RESET_ALL}")
+                sys.exit(1)
+            
+            # Get API key from config if not provided in command line
+            if args.ai and not args.api_key:
+                args.api_key = config.get_api_key(args.ai.lower())
+                if not args.api_key:
+                    print(f"\n{Fore.YELLOW}No API key found for {args.ai}. Set it with:{Style.RESET_ALL}")
+                    print(f"python main.py --set-api-key {args.ai} your-key-here")
+                    sys.exit(1)
+            
+            try:
+                from ai_providers import get_ai_provider
+
+                # Load system info if provided
+                if args.system_info:
+                    try:
+                        with open(args.system_info) as f:
+                            if 'system_info' not in locals():
+                                system_info = json.load(f)
+                            else:
+                                system_info.update(json.load(f))
+                    except Exception as e:
+                        print(f"{Fore.YELLOW}Error loading system info: {str(e)}{Style.RESET_ALL}")
+
+                if args.compare:
+                    # Run analysis with all providers
+                    results = {}
+                    for provider in valid_providers:
+                        try:
+                            # Get API key for each provider
+                            provider_key = config.get_api_key(provider)
+                            if not provider_key:
+                                print(f"{Fore.YELLOW}Skipping {provider}: No API key found{Style.RESET_ALL}")
+                                continue
+                                
+                            ai_provider = get_ai_provider(provider, provider_key)
+                            print(f"\nRunning analysis with {provider.title()}...")
+                            _lr = analyzer.get_results(args.summary)
+                            if args.windows and not (args.local or args.host):
+                                _ws = getattr(analyzer, '_windows_summary', '')
+                                if _ws:
+                                    _lr = _ws
+                            _has_data = (
+                                (isinstance(_lr, str) and _lr.strip()) or
+                                (isinstance(_lr, dict) and (
+                                    _lr.get('stats', {}).get('total_lines', 0) > 0 or
+                                    _lr.get('_windows_summary')
+                                ))
+                            )
+                            if not _has_data:
+                                print(f"{Fore.YELLOW}Skipping {provider}: no log data collected.{Style.RESET_ALL}")
+                                continue
+                            results[provider] = ai_provider.analyze_logs(
+                                _lr,
+                                system_info if 'system_info' in locals() else None
+                            )
+                        except Exception as e:
+                            print(f"Error with {provider}: {str(e)}")
+
+                    # Print comparison
+                    if results:
+                        print("\n=== AI Analysis Comparison ===")
+                        for provider, result in results.items():
+                            print(f"\n{provider.title()} Analysis:")
+                            print(format_ai_recommendations(result))
+                    else:
+                        print(f"\n{Fore.YELLOW}No AI analysis results available{Style.RESET_ALL}")
+                else:
+                    # Run analysis with single provider
+                    try:
+                        ai_provider = get_ai_provider(args.ai, args.api_key)
+                        print(f"\nRunning AI analysis using {args.ai.title()}...")
+
+                        # Build log data: prefer Windows summary when that's the only source
+                        log_results = analyzer.get_results(args.summary)
+                        win_only = args.windows and not (args.local or args.host)
+                        if win_only:
+                            win_sum = getattr(analyzer, '_windows_summary', '')
+                            if win_sum:
+                                log_results = win_sum  # pass the text summary directly
+
+                        # Determine whether there's actually anything to send
+                        has_local = (
+                            isinstance(log_results, dict)
+                            and log_results.get('stats', {}).get('total_lines', 0) > 0
+                        )
+                        has_windows = bool(
+                            getattr(analyzer, '_windows_summary', '') or
+                            (isinstance(log_results, str) and log_results.strip())
+                        )
+
+                        if not has_local and not has_windows:
+                            print(f"{Fore.YELLOW}No log data collected — skipping AI analysis.{Style.RESET_ALL}")
+                        else:
+                            # Get AI recommendations
+                            recommendations = ai_provider.analyze_logs(
+                                log_results,
+                                system_info if 'system_info' in locals() else None
+                            )
+
+                            # Print formatted recommendations
+                            formatted = format_ai_recommendations(recommendations)
+                            print(formatted)
+
+                            # Save to file if output is specified
+                            if args.output:
+                                with open(args.output, 'a') as f:
+                                    f.write('\n' + formatted)
+
+                            # Deep dive — interactive or auto
+                            if args.ai and (args.deep_dive is not None):
+                                from ai_providers import deep_dive_issues
+                                summary_text = recommendations.get('summary', '')
+
+                                # Seed the first round: CLI numbers if given, else ask
+                                if args.deep_dive:
+                                    pending = []
+                                    for v in args.deep_dive:
+                                        try: pending.append(int(v))
+                                        except ValueError: pass
+                                else:
+                                    pending = None  # signal: ask interactively first
+
+                                def _prompt_issues():
+                                    """Print the menu and return a list of ints, or [] to exit."""
+                                    print(f"\n{Fore.CYAN}{'─'*70}")
+                                    print(f"🔬 Deep Dive — Enter issue numbers to investigate")
+                                    print(f"   (e.g.  1    or  1 3    or  all   — Enter to finish)")
+                                    print(f"{'─'*70}{Style.RESET_ALL}")
+                                    try:
+                                        raw = input("  Issues: ").strip().lower()
+                                    except (EOFError, KeyboardInterrupt):
+                                        return []
+                                    if not raw or raw in ('q', 'quit', 'exit', 'done', 'n', 'no'):
+                                        return []
+                                    if raw == 'all':
+                                        return list(range(1, 6))
+                                    return [int(x) for x in raw.split() if x.isdigit()]
+
+                                def _run_dive(issue_nums):
+                                    """Execute one deep dive and print/save results."""
+                                    print(f"\n{Fore.CYAN}Running deep dive on issue(s): "
+                                          f"{issue_nums}...{Style.RESET_ALL}\n")
+                                    try:
+                                        dive_text = deep_dive_issues(
+                                            ai_provider, issue_nums, summary_text
+                                        )
+                                        print(f"\n{'='*70}")
+                                        print(f"{Fore.GREEN}🔬 Deep Dive — Issue(s): "
+                                              f"{', '.join(str(n) for n in issue_nums)}"
+                                              f"{Style.RESET_ALL}")
+                                        print(f"{'='*70}")
+                                        if '===' in dive_text:
+                                            print(format_ai_recommendations(
+                                                {'summary': dive_text, 'severity': 'info'}
+                                            ))
+                                        else:
+                                            for line in _format_section_body(dive_text):
+                                                print(line)
+                                        if args.output:
+                                            with open(args.output, 'a') as f:
+                                                nums_str = ', '.join(str(n) for n in issue_nums)
+                                                f.write(f'\n\n=== Deep Dive (Issue(s): {nums_str}) ===\n'
+                                                        + dive_text)
+                                    except Exception as de:
+                                        print(f"{Fore.RED}Deep dive error: {de}{Style.RESET_ALL}")
+                                        if args.debug:
+                                            import traceback; traceback.print_exc()
+
+                                # First round
+                                issue_nums = pending if pending is not None else _prompt_issues()
+
+                                # Loop: run dive, then keep asking until user quits
+                                while issue_nums:
+                                    _run_dive(issue_nums)
+                                    issue_nums = _prompt_issues()
+
+                                if not (args.deep_dive and pending):
+                                    # Only print "done" in interactive mode
+                                    print(f"\n{Fore.CYAN}Deep dive session ended.{Style.RESET_ALL}")
+
+                    except Exception as e:
+                        print(f"Error with {args.ai}: {str(e)}")
+                        if args.debug:
+                            import traceback
+                            traceback.print_exc()
+                            
+            except ImportError as e:
+                print(f"\n{Fore.YELLOW}Required packages missing. Install with:{Style.RESET_ALL}")
+                print("pip install anthropic google-genai openai")
+                sys.exit(1)
+                
+    except KeyboardInterrupt:
+        print("\nAnalysis interrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\nError during analysis: {str(e)}")
+        if args.debug:
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
+                
+if __name__ == "__main__":
+    main()

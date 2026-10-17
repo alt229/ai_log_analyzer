@@ -248,6 +248,27 @@ Suggested workflow (Mac `andromeda`):
    `python3 main.py --local -t 2h --ai claude --ai-changes-only --quiet`.
    `--report-noise` shows what is normal, what changed, and the ids to filter.
 
+## Platforms (which OS the target runs)
+
+How a machine is reached (local, SSH, `pct exec` for `--guest`) is kept
+apart from what runs there. Each OS is one module in `platforms/`:
+
+| Platform | Module | Logs from |
+|---|---|---|
+| `linux` | `platforms/linux.py` | `journalctl` (local: `--since TIME`; remote: `--since 'Ns ago'`) |
+| `darwin` | `platforms/darwin.py` | `log show --style ndjson` (local and, new, over SSH) |
+
+For `--host`, the OS is detected automatically: the SSH server banner
+(no command needed), then one probe command that also returns the machine
+identity, so it costs no extra round-trip. The probe runs under `sh -c`,
+so a csh/tcsh login shell works too. `--platform linux|darwin` skips the
+detection. Not supported yet, with a clear error and exit 1: FreeBSD,
+pfSense, MikroTik RouterOS, Linux without journald (e.g. Alpine).
+
+To add an OS: a new module with `NAME`, `TOOL`, `remote_cmd(collector,
+seconds)`, `parse(collector, text)`, `local_logs(collector, since)`, an
+entry in `platforms.PLATFORMS`, and a rule in `platforms.detect()`.
+
 ## Proxmox LXC containers (`--guest`)
 
 On a Proxmox host, ai_logs can read the journal of each LXC container

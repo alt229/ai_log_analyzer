@@ -1,5 +1,12 @@
 # collector.py
 # History:
+# 2026-10-10 - Script Wrangler: HOW a machine is reached stays here (local,
+#   SSH, pct exec); WHAT runs there moved to platforms/ (linux.py:
+#   journalctl, darwin.py: log show; LogLine and the MAC_* names are
+#   re-exported). A remote OS is detected from the SSH banner plus one
+#   probe command, which also carries the identity lines (so still one
+#   command); self.platform_forced = --platform. Remote macOS now uses log
+#   show instead of journalctl (platforms.patch).
 # 2026-10-10 - Script Wrangler: --guest: with self.guest set (a Proxmox LXC
 #   container id), journalctl and the identity command run inside that
 #   container via `pct exec ID -- sh -c '...'` on the --host (needs root
@@ -31,20 +38,14 @@ import os
 import sys
 import json
 
-# macOS `log show` predicates. Default: only real errors and faults (field
-# `logType`, as listed by `log help predicates`). --all-levels: the old
-# keyword filter, which also catches ordinary messages that merely mention
-# "error", "warning", "failed" etc.
-MAC_LEVEL_PREDICATE = '(logType == "error" OR logType == "fault")'
-MAC_KEYWORD_PREDICATE = '(eventMessage CONTAINS[c] "error" OR eventMessage CONTAINS[c] "warning" OR eventMessage CONTAINS[c] "failure" OR eventMessage CONTAINS[c] "failed" OR process == "system")'
-# macOS log type -> analyzer/dedup severity (other types: decided by keywords)
-MAC_LEVELS = {'fault': 'critical', 'error': 'error'}
-# identify(): the ONE extra remote command. Linux: the machine-id file; macOS:
-# ioreg's IOPlatformUUID line; plus the host name (information only). Output
-# is read by target_store.parse_identity(). Plain sh syntax (bash/dash/zsh).
-IDENTIFY_CMD = ('echo "machine-id=$(cat /etc/machine-id 2>/dev/null || cat /var/lib/dbus/machine-id 2>/dev/null)"; '
-                '[ -x /usr/sbin/ioreg ] && /usr/sbin/ioreg -rd1 -c IOPlatformExpertDevice | grep IOPlatformUUID; '
-                'echo "hostname=$(hostname 2>/dev/null)"')
+import platforms
+from platforms.darwin import (MAC_LEVEL_PREDICATE, MAC_KEYWORD_PREDICATE, MAC_LEVELS,  # noqa: F401
+                              LogLine, parse_macos_ndjson, _is_own_log_show)
+
+# identify(): the ONE extra remote command, platforms.PROBE_CMD: the OS
+# (detection) plus the machine-id file / macOS ioreg IOPlatformUUID line and
+# the host name, read by target_store.parse_identity().
+IDENTIFY_CMD = platforms.PROBE_CMD
 # Host key check (HostKeyCheck): OpenSSH known_hosts files, read only (never
 # written; a missing file is simply empty), plus hosts.json (target_store).
 KNOWN_HOSTS_FILES = ('~/.ssh/known_hosts', '/etc/ssh/ssh_known_hosts')
@@ -128,80 +129,6 @@ class HostKeyCheck(paramiko.MissingHostKeyPolicy):
         self.collector._check_hostkey(key)
 
 
-class LogLine(str):
-    """A log line (a normal str) plus fields from `log show --style ndjson`:
-    process = full process name (may contain spaces), level = 'critical'
-    (fault), 'error' or None, subsystem (or None) and message (the event
-    message alone; noise_filters.py matches on these), epoch (the record's
-    time in seconds since 1970, None if unparseable) and pid (processID).
-    Lines from SSH, Linux and Docker are plain str."""
-    def __new__(cls, text, process=None, level=None, subsystem=None, message=None,
-                epoch=None, pid=None):
-        self = super().__new__(cls, text)
-        self.process = process
-        self.level = level
-        self.subsystem = subsystem
-        self.message = message
-        self.epoch = epoch
-        self.pid = pid
-        return self
-
-
-def _is_own_log_show(process, message):
-    """The `log` process's note about a `log show` run, like ours (it repeats
-    our predicate, so it matched "error"). Only that kind of `log` line."""
-    return (process == 'log' and 'log run noninteractively' in message
-            and "'log' 'show'" in message)
-
-
-def parse_macos_ndjson(text, drop_pids=(), stats=None):
-    """`log show --style ndjson` output -> list of LogLine in the syslog shape
-    "TIMESTAMP  localhost proc[PID]: (sender) [subsystem:category] message".
-    One JSON object per line. A line that is not a JSON object is kept as
-    plain text, so nothing is lost if the format changes. Records whose
-    processID is in drop_pids (this tool and its `log` child) are dropped
-    and counted in stats['own']."""
-    from log_dedup import line_epoch
-    out = []
-    for raw in text.splitlines():
-        if not raw.strip():
-            continue
-        rec = None
-        if raw.lstrip().startswith('{'):
-            try:
-                rec = json.loads(raw)
-            except ValueError:
-                rec = None
-        if not isinstance(rec, dict):
-            if not (' log[' in raw and _is_own_log_show('log', raw)):
-                out.append(raw)
-            continue
-        msg = str(rec.get('eventMessage') or rec.get('composedMessage') or rec.get('message') or '')
-        msg = ' '.join(msg.splitlines())   # one record = one line
-        proc = str(rec.get('process') or os.path.basename(str(rec.get('processImagePath') or ''))
-                   or 'unknown')
-        if _is_own_log_show(proc, msg):
-            continue
-        pid = next((rec[k] for k in ('processID', 'processIdentifier') if rec.get(k) is not None), 0)
-        if drop_pids and pid in drop_pids:   # exact pid match: our own process or our `log show`
-            if stats is not None:
-                stats['own'] = stats.get('own', 0) + 1
-            continue
-        sender = rec.get('sender') or os.path.basename(str(rec.get('senderImagePath') or ''))
-        sub, cat = rec.get('subsystem') or '', rec.get('category') or ''
-        kind = str(rec.get('messageType') or rec.get('logType') or '').lower()
-        ts = rec.get('timestamp') or rec.get('date') or ''
-        line = f"{ts}  localhost {proc}[{pid}]:"
-        if sender:
-            line += f" ({sender})"
-        if sub or cat:
-            line += f" [{sub}:{cat}]"
-        out.append(LogLine(f"{line} {msg}", process=proc, level=MAC_LEVELS.get(kind),
-                           subsystem=str(sub) if sub else None, message=msg,
-                           epoch=line_epoch(str(ts)) if ts else None, pid=pid))
-    return out
-
-
 class LogCollector:
     def __init__(self, host: Optional[str] = None, user: Optional[str] = None, 
                  port: int = 22, key_file: Optional[str] = None):
@@ -223,6 +150,9 @@ class LogCollector:
         self.hostkey_info = None     # set by _check_hostkey: type, fingerprint, verdict
         self._recorded_keys = []     # [(type, fingerprint, where)] for this host, for _check_hostkey
         self.guest = None            # main.py --guest: Proxmox LXC id; commands run via pct exec
+        self.platform_forced = None  # main.py --platform NAME (else detected)
+        self.platform = None         # platforms name ('linux', 'darwin'), set by detection
+        self.platform_why = None     # how it was decided, or why none fits
 
     @staticmethod
     def _check_result(what, rc, stdout, stderr):
@@ -233,45 +163,6 @@ class LogCollector:
             raise RuntimeError(f"{what} failed (exit {rc}): {err or 'no error message'}")
         if err:
             print(f"Warning from {what}: {err}", file=sys.stderr)
-
-    def _get_logs_macos(self, since: str) -> List[str]:
-        """Get logs from local macOS system as LogLine objects (ndjson gives the
-        real log level and full process names, which syslog style does not)."""
-        # Convert our timestamp to macOS log show format
-        since_dt = datetime.strptime(since, '%Y-%m-%d %H:%M:%S')
-        macos_time = since_dt.strftime('%Y-%m-%d %H:%M:%S')
-        predicate = MAC_KEYWORD_PREDICATE if self.mac_levels == 'all' else MAC_LEVEL_PREDICATE
-        if self.noise_filters:   # known noise: AND NOT (...), so log show never returns it
-            from noise_filters import mac_exclusions
-            extra, self.noise_at_source = mac_exclusions(self.noise_filters)
-            predicate += extra
-
-        cmd = [
-            'log', 'show',
-            '--start', macos_time,
-            '--style', 'ndjson',   # one JSON object per line (json = one big array)
-            '--predicate', predicate
-        ]
-
-        # Popen instead of run(): the child's pid lets us drop its own log lines
-        with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                              encoding='utf-8', errors='replace') as proc:
-            stdout, stderr = proc.communicate()
-        self._check_result('log show', proc.returncode, stdout, stderr)
-        stats = {}
-        lines = parse_macos_ndjson(stdout, drop_pids={os.getpid(), proc.pid}, stats=stats)
-        self.own_lines_dropped = stats.get('own', 0)
-        return lines
-
-    def _get_logs_linux(self, since: str) -> List[str]:
-        """Get logs from local Linux system"""
-        try:
-            cmd = ['journalctl', '--since', since]
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            self._check_result('journalctl', result.returncode, result.stdout, result.stderr)
-            return result.stdout.splitlines()
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"Failed to get Linux logs: {str(e)}")
 
     def _remote_cmd(self, cmd: str) -> str:
         """cmd as sent over SSH: inside LXC container self.guest via pct exec
@@ -304,13 +195,45 @@ class LogCollector:
                 guests.append((parts[0], parts[-1]))
         return guests
 
+    def _banner(self) -> str:
+        """The SSH server's version string (e.g. SSH-2.0-OpenSSH_10.0p2 Debian-7)."""
+        t = self.ssh.get_transport() if self.ssh else None
+        return str(getattr(t, 'remote_version', '') or '')
+
+    def _detect(self, probe_out=None):
+        """Set self.platform / platform_why: --platform, else the SSH banner and
+        the PROBE_CMD output (run here if not given; not on RouterOS, which
+        has no Unix shell). Remote only; needs the connection."""
+        if self.platform_forced:
+            self.platform, self.platform_why = self.platform_forced, '--platform'
+            return
+        banner = self._banner()
+        if probe_out is None and 'ROSSSH' not in banner:
+            _stdin, stdout, _stderr = self.ssh.exec_command(self._remote_cmd(platforms.PROBE_CMD),
+                                                            timeout=20)
+            probe_out = stdout.read().decode('utf-8', 'replace')
+            stdout.channel.recv_exit_status()
+        self.platform, self.platform_why = platforms.detect(banner, probe_out)
+
+    def _local_platform(self):
+        """Local: --platform, else Darwin -> darwin, anything else -> linux."""
+        name = self.platform_forced or ('darwin' if self.system == 'Darwin' else 'linux')
+        self.platform, self.platform_why = name, ('--platform' if self.platform_forced
+                                                  else f"local {self.system}")
+        return platforms.get(name)
+
     def _get_logs_remote(self, seconds: int) -> List[str]:
-        """Get logs from remote system via SSH (the last `seconds` seconds)"""
+        """Get logs from remote system via SSH (the last `seconds` seconds),
+        with the command of the detected platform (platforms/)."""
         self._connect_ssh()
-        # Relative time, so the remote host's own clock/time zone decides the
-        # window (an absolute Mac-local timestamp is read in the remote's zone).
-        cmd = f"journalctl --since '{int(seconds)}s ago'"
-        
+        if self.ssh is None:
+            raise RuntimeError('no SSH connection (--host and --user needed)')
+        if self.platform is None:
+            self._detect()
+        if self.platform is None:
+            raise RuntimeError(f"{self._where()}: {self.platform_why}")
+        p = platforms.get(self.platform)
+        cmd = p.remote_cmd(self, seconds)
         try:
             stdin, stdout, stderr = self.ssh.exec_command(self._remote_cmd(cmd))
             out = stdout.read().decode('utf-8', 'replace')
@@ -318,8 +241,8 @@ class LogCollector:
             rc = stdout.channel.recv_exit_status()
         except Exception as e:
             raise RuntimeError(f"Failed to get remote logs: {str(e)}")
-        self._check_result(f"journalctl on {self._where()}", rc, out, err)
-        return out.splitlines()
+        self._check_result(f"{p.TOOL} on {self._where()}", rc, out, err)
+        return p.parse(self, out)
 
     def _connect_ssh(self):
         """Establish SSH connection if needed. A failure is kept and raised again
@@ -500,10 +423,7 @@ class LogCollector:
         try:
             if self.host:
                 return self._get_logs_remote(max(1, round(hours * 3600)))
-            elif self.system == 'Darwin':
-                return self._get_logs_macos(since)
-            else:
-                return self._get_logs_linux(since)
+            return self._local_platform().local_logs(self, since)
         except Exception as e:
             self.last_error = str(e)   # main.py: exit 1 instead of "No logs were collected"
             print(f"Error collecting logs: {str(e)}", file=sys.stderr)
@@ -539,11 +459,16 @@ class LogCollector:
             ident['error'] = 'no SSH connection' if self.connect_error else f"no SSH host key: {e}"
             if self.connect_error:
                 return ident
+        if 'ROSSSH' in self._banner():   # no Unix shell: no probe (platforms.detect says why)
+            self._detect('')
+            ident['error'] = self.platform_why
+            return ident
         try:
             _stdin, stdout, _stderr = self.ssh.exec_command(self._remote_cmd(IDENTIFY_CMD), timeout=20)
             out = stdout.read().decode('utf-8', 'replace')
             stdout.channel.recv_exit_status()
             ident.update(target_store.parse_identity(out))
+            self._detect(out)   # the same output says which OS it is
         except Exception as e:
             ident['error'] = f"identity command failed: {e}"
         if not ident['machine_id'] and not ident['error']:

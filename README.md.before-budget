@@ -1,0 +1,167 @@
+# AI Log Analyzer
+
+Analyze system logs from local or remote Mac, Linux, and **Windows** hosts,
+with optional AI-powered summarization.
+
+## Installation
+
+```bash
+pip install -r requirements.txt
+```
+
+> For Windows support, `impacket` must be installed (included in requirements).
+
+## Quick Start
+
+```bash
+# Local macOS/Linux — last 15 minutes, the default  (--local is now required to scan local machine)
+python main.py --local
+
+# Local logs, last 2 hours, errors only  (-t: 90s, 15m, 2h, 1d, 1h30m; bare number = hours)
+python main.py --local -t 2h --only-errors
+
+# Remote Linux over SSH — last 6 hours, errors only
+python main.py -t 6 --host 10.0.0.10 --user root --key ~/.ssh/id_ed25519 --only-errors
+
+# Remote Windows via WMI — last month (default), warnings and above
+python main.py --windows --win-host 192.168.1.50 --win-user Administrator
+
+# Remote Windows — last day, errors only, specific logs
+python main.py --windows --win-host 192.168.1.50 --win-user Administrator \
+               --win-time day --win-level error --win-logs System Application
+
+# Remote Windows — all time (use carefully on busy hosts)
+python main.py --windows --win-host 192.168.1.50 --win-user Administrator \
+               --win-time all --win-level error
+
+# Combine Windows analysis with AI
+python main.py --windows --win-host 192.168.1.50 --win-user Administrator \
+               --ai claude
+```
+
+## Windows Setup Requirements
+
+On the **target Windows host**:
+1. WMI service must be running: `services.msc` → "Windows Management Instrumentation"
+2. Remote WMI must be allowed through the firewall:
+   ```
+   netsh advfirewall firewall set rule group="windows management instrumentation (wmi)" new enable=yes
+   ```
+3. User account must be in **Administrators** or **Event Log Readers** group
+4. DCOM must be enabled (it is by default on all modern Windows versions)
+
+## Windows Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--windows` | — | Enable Windows Event Log mode |
+| `--win-host` | — | Target host IP or hostname (required) |
+| `--win-user` | Administrator | Username |
+| `--win-password` | (prompted) | Password |
+| `--win-domain` | (local) | Domain name |
+| `--win-hashes` | — | NTLM hash auth `LM:NT` (alternative to password) |
+| `--win-time` | month | Time window: `hour`, `day`, `week`, `month`, `all` |
+| `--win-logs` | System Application Security | Log channels to query |
+| `--win-level` | warning | Min level: `critical`, `error`, `warning`, `information`, `all` |
+| `--win-max-events` | 5000 | Max events per log channel |
+| `--win-show-noisy` | — | Include events from known noisy sources |
+
+## AI Configuration
+
+```bash
+# Save API keys (stored in ~/.config/ai_logs/config.yaml)
+python main.py --set-api-key claude sk-ant-...
+python main.py --set-api-key chatgpt sk-...
+python main.py --set-api-key gemini AI...
+
+# Use AI analysis
+python main.py --local -t 15m --ai claude
+python main.py --windows --win-host 10.0.0.5 --ai claude
+
+# See the size (exact tokens for Claude) without calling the model
+python main.py --local -t 1h --ai claude --dry-run-ai
+```
+
+## Time window and what is sent to the AI
+
+- `-t/--time` sets how far back local/SSH/Docker logs go: `90s`, `15m`, `2h`,
+  `1d` or `1h30m` (any case; `m` = minutes). A bare number still means hours
+  (`-t 6` = 6 hours). Default: `15m`. Windows uses `--win-time` instead.
+  Remote hosts get a relative window (`journalctl --since '900s ago'`,
+  `docker logs --since 900s`), so their own time zone doesn't shift it.
+- Before anything goes to the AI, matched lines are grouped into patterns
+  (timestamps, PIDs, numbers, hex IDs, UUIDs, IPs, MACs, durations and
+  quoted paths masked). Each pattern is sent once with its count, first/last
+  time and `--max-examples` raw example line(s) (default 1), errors first,
+  then by count. `--ai-max-chars N` (default 12000) caps the size: the
+  lowest-priority patterns are dropped first and the prompt says how many.
+  It never sends more than the old format would have.
+- A one-line summary on stderr comes before each AI call: lines, patterns,
+  chars, and input tokens (exact for Claude via the free `count_tokens`
+  endpoint, otherwise an estimate of chars/4).
+- `--max-input-tokens N`: don't send if the request is bigger; exit 1 with
+  hints. `--dry-run-ai`: build the request, print the summary, exit 0
+  without calling the model (still needs an API key).
+
+## macOS log levels (`--local` on a Mac)
+
+- By default only real errors and faults are fetched:
+  `log show --style ndjson --predicate '(logType == "error" OR logType == "fault")'`.
+  Faults go to the AI as `[CRITICAL]`, errors as `[ERROR]`. Process names
+  keep their spaces (`Bartender 6`), and the `log` process's note about the
+  tool's own `log show` run is dropped.
+- `--all-levels` brings back the old keyword filter (any message mentioning
+  error/warning/failure/failed, or process `system`): much noisier.
+  `--only-warnings`, `--only-info` and `--ignore errors` imply it.
+- Local Linux, SSH and Docker are unchanged (no level filter). For journald
+  the equivalent would be `journalctl -p warning` (priorities 0-4,
+  emerg..warning); not done yet.
+- "Total matches found: N lines" and the AI line's "N matched" are the same
+  count. The AI's severity badge comes from its own `SEVERITY:` first line;
+  "(heuristic)" means the reply had none and a keyword guess is shown.
+- A failed collection (`log show` refused, SSH or `docker` error, non-zero
+  exit) prints the real error on stderr and exits 1. "No logs were
+  collected" means the command worked and found nothing (exit 0).
+
+## Claude options
+
+- `--model`: `sonnet` (default, `claude-sonnet-5-5`), `opus`
+  (`claude-opus-5-5`), `haiku` (`claude-haiku-5-5`), or any full ID starting
+  with `claude-`. Without `--model`, `claude_model:` in config.yaml is used if
+  set. The model is shown in the summary line. Gemini/ChatGPT are unchanged.
+- Refusal fallback: on by default, `--no-fallback` to disable. A refusal
+  (`stop_reason: refusal`, which security logs can trigger) is reported with
+  its category and makes the run exit 1. If the installed `anthropic` package
+  doesn't support the fallback option, a one-line note is printed and the call
+  is retried once without it.
+- Interactive `--deep-dive` rounds mark the earlier analysis for prompt caching,
+  so the 2nd and later rounds within 5 minutes read it at a lower price.
+  `--deep-dive 1 3` (one round) and plain runs don't use caching.
+  `--debug` prints each response's token usage, including cache reads.
+
+## Output Options
+
+| Flag | Description |
+|------|-------------|
+| `--full` | Show full messages without truncation |
+| `--json` | Output as JSON |
+| `-o FILE` | Write output to file |
+| `--debug` | Show debug/traceback info |
+| `--only-errors` | Show errors only |
+| `--only-warnings` | Show warnings only |
+| `--no-color` | Disable colored output |
+
+## Architecture
+
+```
+main.py              — CLI entry point, argument parsing
+collector.py         — Mac/Linux log collection (local + SSH)
+windows_collector.py — Windows Event Log via WMI/DCOM
+analyzer.py          — Pattern-based log analysis (Mac/Linux)
+windows_analyzer.py  — Windows Event ID database + analysis
+ai_providers.py      — Claude / ChatGPT / Gemini integration
+ai_analyzer.py       — AI prompt building
+local_insights.py    — Local pattern insights
+docker_collector.py  — Docker container log collection
+config.py            — Configuration management
+```
